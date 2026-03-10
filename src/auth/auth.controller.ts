@@ -37,10 +37,12 @@ export class AuthController {
   @Get('google/callback')
   @UseGuards(GoogleOAuthGuard)
   googleCallback(@Req() req: Request, @Res() res: Response) {
-    const user = req.user as { id: string; email: string }
+    const user = req.user as { id: string; email: string; name?: string; avatar?: string }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
+      user.name,
+      user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
@@ -59,10 +61,12 @@ export class AuthController {
   @Get('github/callback')
   @UseGuards(GithubOAuthGuard)
   githubCallback(@Req() req: Request, @Res() res: Response) {
-    const user = req.user as { id: string; email: string }
+    const user = req.user as { id: string; email: string; name?: string; avatar?: string }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
+      user.name,
+      user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
@@ -91,6 +95,8 @@ export class AuthController {
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
+      user.name,
+      user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return {
@@ -109,10 +115,12 @@ export class AuthController {
   @UseGuards(JwtRefreshGuard)
   @HttpCode(HttpStatus.OK)
   refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
-    const { userId, email } = req.user as { userId: string; email: string }
+    const { userId, email, name, avatar } = req.user as { userId: string; email: string; name?: string; avatar?: string }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       userId,
       email,
+      name,
+      avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return { message: 'Tokens refreshed' }

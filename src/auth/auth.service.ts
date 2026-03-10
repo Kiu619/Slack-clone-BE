@@ -9,9 +9,10 @@ import { users, accounts } from '../database/schema'
 import { RedisService } from '../redis/redis.service'
 import { MailService } from '../mail/mail.service'
 
-const MAGIC_TOKEN_TTL = 60 * 15 // 15 minutes
-const ACCESS_TOKEN_COOKIE_TTL = 15 * 60 * 1000
-const REFRESH_TOKEN_COOKIE_TTL = 7 * 24 * 60 * 60 * 1000
+const MAGIC_TOKEN_TTL = 60 * 15
+
+const ACCESS_TOKEN_COOKIE_TTL = 31 * 24 * 60 * 60 * 1000
+const REFRESH_TOKEN_COOKIE_TTL = 100 * 24 * 60 * 60 * 1000
 
 export interface OAuthUserData {
   provider: string
@@ -106,12 +107,28 @@ export class AuthService {
     return user
   }
 
-  generateTokens(userId: string, email: string) {
+  /**
+   * generateTokens — tạo JWT access + refresh token
+   *
+   * Access token payload chứa { sub, email, name, avatar } để:
+   *   - ChatGateway đọc userName mà không cần query DB khi WS connect
+   *   - MessageController truyền userInfo đầy đủ (kể cả avatar) vào createMessage
+   *
+   * Trade-off: avatar URL trong token sẽ stale nếu user thay avatar.
+   * Acceptable vì: token expire sau 30d, và avatar change rất ít khi xảy ra.
+   * Nếu cần real-time avatar update → bỏ avatar ra khỏi JWT, query DB mỗi lần.
+   */
+  generateTokens(
+    userId: string,
+    email: string,
+    name?: string | null,
+    avatar?: string | null,
+  ) {
     const accessToken = this.jwt.sign(
-      { sub: userId, email },
+      { sub: userId, email, name: name ?? null, avatar: avatar ?? null },
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
-        expiresIn: this.config.get('JWT_ACCESS_EXPIRATION') ?? '15m',
+        expiresIn: this.config.get('JWT_ACCESS_EXPIRATION') ?? '30d',
       },
     )
 
@@ -119,7 +136,7 @@ export class AuthService {
       { sub: userId, email },
       {
         secret: this.config.getOrThrow<string>('JWT_REFRESH_SECRET'),
-        expiresIn: this.config.get('JWT_REFRESH_EXPIRATION') ?? '7d',
+        expiresIn: this.config.get('JWT_REFRESH_EXPIRATION') ?? '90d',
       },
     )
 

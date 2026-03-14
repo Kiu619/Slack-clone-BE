@@ -9,6 +9,7 @@ export interface JwtPayload {
   email: string
   name?: string | null
   avatar?: string | null
+  isAway?: boolean
 }
 
 @Injectable()
@@ -16,7 +17,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   constructor(config: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
-        (req: Request) => req?.cookies?.access_token ?? null,
+        (req: Request) => (req?.cookies?.access_token as string) ?? null,
       ]),
       secretOrKey: config.getOrThrow<string>('JWT_ACCESS_SECRET'),
       ignoreExpiration: false,
@@ -29,6 +30,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       email: payload.email,
       name: payload.name ?? null,
       avatar: payload.avatar ?? null,
+      isAway: payload.isAway ?? false,
     }
   }
 }

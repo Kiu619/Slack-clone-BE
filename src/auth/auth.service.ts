@@ -123,9 +123,16 @@ export class AuthService {
     email: string,
     name?: string | null,
     avatar?: string | null,
+    isAway?: boolean,
   ) {
     const accessToken = this.jwt.sign(
-      { sub: userId, email, name: name ?? null, avatar: avatar ?? null },
+      {
+        sub: userId,
+        email,
+        name: name ?? null,
+        avatar: avatar ?? null,
+        isAway,
+      },
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
         expiresIn: this.config.get('JWT_ACCESS_EXPIRATION') ?? '30d',

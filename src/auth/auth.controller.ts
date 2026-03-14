@@ -37,12 +37,19 @@ export class AuthController {
   @Get('google/callback')
   @UseGuards(GoogleOAuthGuard)
   googleCallback(@Req() req: Request, @Res() res: Response) {
-    const user = req.user as { id: string; email: string; name?: string; avatar?: string }
+    const user = req.user as {
+      id: string
+      email: string
+      name?: string
+      avatar?: string
+      isAway?: boolean
+    }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
       user.name,
       user.avatar,
+      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
@@ -61,12 +68,19 @@ export class AuthController {
   @Get('github/callback')
   @UseGuards(GithubOAuthGuard)
   githubCallback(@Req() req: Request, @Res() res: Response) {
-    const user = req.user as { id: string; email: string; name?: string; avatar?: string }
+    const user = req.user as {
+      id: string
+      email: string
+      name?: string
+      avatar?: string
+      isAway?: boolean
+    }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
       user.name,
       user.avatar,
+      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
@@ -97,6 +111,7 @@ export class AuthController {
       user.email,
       user.name,
       user.avatar,
+      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return {
@@ -105,6 +120,7 @@ export class AuthController {
         email: user.email,
         name: user.name,
         avatar: user.avatar,
+        isAway: user.isAway,
       },
     }
   }
@@ -115,12 +131,19 @@ export class AuthController {
   @UseGuards(JwtRefreshGuard)
   @HttpCode(HttpStatus.OK)
   refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
-    const { userId, email, name, avatar } = req.user as { userId: string; email: string; name?: string; avatar?: string }
+    const { userId, email, name, avatar, isAway } = req.user as {
+      userId: string
+      email: string
+      name?: string
+      avatar?: string
+      isAway?: boolean
+    }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       userId,
       email,
       name,
       avatar,
+      isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return { message: 'Tokens refreshed' }

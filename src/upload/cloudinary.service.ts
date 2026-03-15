@@ -1,22 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { v2 as cloudinary } from 'cloudinary'
-
-/**
- * CloudinaryService — Quản lý upload media (image/video) lên Cloudinary
- *
- * Flow:
- * 1. Client gọi POST /upload/presigned-url/cloudinary với { fileName, fileType }
- * 2. Backend generate signature + timestamp + upload preset
- * 3. Client upload trực tiếp lên Cloudinary API (không qua server)
- * 4. Cloudinary trả về secure_url → client gọi POST /attachments để lưu metadata
- *
- * Lợi ích:
- * - Auto-optimize: q_auto, f_auto (WebP/AVIF), responsive breakpoints
- * - Transformation on-the-fly: resize, crop, blur, watermark...
- * - Video transcoding: adaptive bitrate, thumbnails
- * - CDN built-in (fast delivery)
- */
 @Injectable()
 export class CloudinaryService implements OnModuleInit {
   private readonly logger = new Logger(CloudinaryService.name)

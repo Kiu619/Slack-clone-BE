@@ -1,13 +1,10 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
-
 import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { eq, inArray } from 'drizzle-orm'
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres'
 import { DRIZZLE } from '../database/database.module'
 import * as schema from '../database/schema'
 import { attachments } from '../database/schema'
+import { S3Service } from '../upload/s3.service'
 import type { CreateAttachmentDto } from './dto/create-attachment.dto'
 
 /**
@@ -22,7 +19,10 @@ import type { CreateAttachmentDto } from './dto/create-attachment.dto'
 export class AttachmentService {
   private readonly logger = new Logger(AttachmentService.name)
 
-  constructor(@Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>) {}
+  constructor(
+    @Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>,
+    private readonly s3Service: S3Service,
+  ) {}
 
   /**
    * Tạo attachment record sau khi file đã upload lên S3/Cloudinary
@@ -59,6 +59,20 @@ export class AttachmentService {
       `Created attachment: ${attachment.id} for message ${dto.messageId}`,
     )
 
+    // Trả presigned URL cho S3 (bucket private), truyền name để download đúng tên tiếng Việt
+    const key = this.s3Service.parseS3KeyFromUrl(attachment.url)
+    if (key) {
+      try {
+        const signedUrl = await this.s3Service.getPresignedGetUrl(
+          key,
+          86400,
+          attachment.name,
+        )
+        return { ...attachment, url: signedUrl }
+      } catch {
+        // Fallback: trả URL gốc
+      }
+    }
     return attachment
   }
 

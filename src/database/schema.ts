@@ -7,6 +7,7 @@ import {
   index,
   boolean,
   integer,
+  doublePrecision,
   pgEnum,
 } from 'drizzle-orm/pg-core'
 import { relations } from 'drizzle-orm'
@@ -245,8 +246,8 @@ export const attachments = pgTable(
     width: integer('width'),
     /** Height (px) cho image/video */
     height: integer('height'),
-    /** Duration (giây) cho video/audio */
-    duration: integer('duration'),
+    /** Duration (giây) cho video/audio — dùng double vì Cloudinary trả về số thập phân */
+    duration: doublePrecision('duration'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => [index('attachments_message_idx').on(table.messageId)],

@@ -32,8 +32,6 @@ import { ChatBroadcastService } from './chat-broadcast.service'
  *   join-channel    { channelId }
  *   leave-channel   { channelId }
  *   message         { channelId, content, parentId? }
- *   typing:start    { channelId }
- *   typing:stop     { channelId }
  *   reaction:toggle { messageId, emoji }
  *   message:edit    { messageId, content }
  *   message:delete  { messageId }
@@ -55,14 +53,19 @@ import { ChatBroadcastService } from './chat-broadcast.service'
   // Cookie-based auth: đọc access_token từ cookie
   transports: ['websocket', 'polling'],
 })
-export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+export class ChatGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer()
   server: Server
 
   private readonly logger = new Logger(ChatGateway.name)
 
   /** Map socketId → userId để lookup khi disconnect */
-  private socketUserMap = new Map<string, { userId: string; name: string | null }>()
+  private socketUserMap = new Map<
+    string,
+    { userId: string; name: string | null }
+  >()
 
   constructor(
     private readonly messageService: MessageService,
@@ -100,12 +103,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       }
 
       const secret = this.configService.get<string>('JWT_ACCESS_SECRET')
-      const payload = this.jwtService.verify(token, { secret }) as {
-        sub: string
-        email: string
-        name?: string | null
-        avatar?: string | null
-      }
+      const payload = this.jwtService.verify(token, { secret })
 
       if (!payload.sub) {
         client.disconnect()
@@ -116,7 +114,10 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       client.data.userId = payload.sub
       client.data.userName = payload.name ?? null
       client.data.userAvatar = payload.avatar ?? null
-      this.socketUserMap.set(client.id, { userId: payload.sub, name: payload.name ?? null })
+      this.socketUserMap.set(client.id, {
+        userId: payload.sub,
+        name: payload.name ?? null,
+      })
 
       void client.join(`user:${payload.sub}`)
 
@@ -132,7 +133,9 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     const userInfo = this.socketUserMap.get(client.id)
     if (userInfo) {
       this.socketUserMap.delete(client.id)
-      this.logger.log(`Socket ${client.id} disconnected: user ${userInfo.userId}`)
+      this.logger.log(
+        `Socket ${client.id} disconnected: user ${userInfo.userId}`,
+      )
     }
   }
 
@@ -171,7 +174,8 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('message')
   async handleMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string; content: string; parentId?: string },
+    @MessageBody()
+    data: { channelId: string; content: string; parentId?: string },
   ) {
     const userId = client.data.userId as string
     if (!userId) throw new WsException('Unauthorized')
@@ -188,47 +192,12 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     return { success: true, messageId: message.id }
   }
 
-  /**
-   * typing:start — user bắt đầu gõ
-   * Broadcast tới tất cả members khác trong channel (trừ người gửi)
-   */
-  @SubscribeMessage('typing:start')
-  handleTypingStart(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
-    const userId = client.data.userId as string
-    const userName = client.data.userName as string | null
-
-    // Broadcast tới tất cả NGOẠI TRỪ người gửi
-    client.to(`channel:${data.channelId}`).emit('typing', {
-      channelId: data.channelId,
-      user: { userId, name: userName },
-      isTyping: true,
-    })
-  }
-
-  /** typing:stop — user ngừng gõ */
-  @SubscribeMessage('typing:stop')
-  handleTypingStop(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { channelId: string },
-  ) {
-    const userId = client.data.userId as string
-    const userName = client.data.userName as string | null
-
-    client.to(`channel:${data.channelId}`).emit('typing', {
-      channelId: data.channelId,
-      user: { userId, name: userName },
-      isTyping: false,
-    })
-  }
-
   /** reaction:toggle — thêm/bỏ reaction, broadcast kết quả */
   @SubscribeMessage('reaction:toggle')
   async handleReaction(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { messageId: string; emoji: string; channelId: string },
+    @MessageBody()
+    data: { messageId: string; emoji: string; channelId: string },
   ) {
     const userId = client.data.userId as string
     if (!userId) throw new WsException('Unauthorized')
@@ -254,7 +223,8 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('message:edit')
   async handleEditMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { messageId: string; content: string; channelId: string },
+    @MessageBody()
+    data: { messageId: string; content: string; channelId: string },
   ) {
     const userId = client.data.userId as string
     if (!userId) throw new WsException('Unauthorized')
@@ -278,7 +248,10 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     const userId = client.data.userId as string
     if (!userId) throw new WsException('Unauthorized')
 
-    const result = await this.messageService.deleteMessage(data.messageId, userId)
+    const result = await this.messageService.deleteMessage(
+      data.messageId,
+      userId,
+    )
 
     this.server.to(`channel:${data.channelId}`).emit('message:deleted', {
       messageId: data.messageId,

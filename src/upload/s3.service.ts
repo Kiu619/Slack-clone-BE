@@ -1,4 +1,8 @@
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import {
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import {
   BadRequestException,
@@ -82,9 +86,10 @@ export class S3Service implements OnModuleInit {
       'AWS_SECRET_ACCESS_KEY',
     )
     this.bucketName = this.config.getOrThrow<string>('S3_BUCKET_NAME')
-    
+
     // Normalize folder prefix: remove leading/trailing slashes, default to 'slack-clone'
-    const rawPrefix = this.config.get<string>('S3_FOLDER_PREFIX') ?? 'slack-clone'
+    const rawPrefix =
+      this.config.get<string>('S3_FOLDER_PREFIX') ?? 'slack-clone'
     this.folderPrefix = rawPrefix.replace(/^\/+|\/+$/g, '') || 'slack-clone'
 
     this.s3Client = new S3Client({
@@ -139,16 +144,71 @@ export class S3Service implements OnModuleInit {
   }
 
   /**
-   * Get public URL của file đã upload
-   * (Nếu bucket là public, hoặc dùng CloudFront)
+   * Get public URL của file đã upload (dùng để lưu DB)
+   * Lưu ý: bucket private → phải dùng getPresignedGetUrl() khi trả về API
    */
   getPublicUrl(key: string): string {
-    // Option 1: S3 direct URL (nếu bucket public)
     return `https://${this.bucketName}.s3.${this.config.get('AWS_REGION')}.amazonaws.com/${key}`
+  }
 
-    // Option 2: CloudFront URL (nếu có CDN)
-    // const cloudFrontDomain = this.config.get('CLOUDFRONT_DOMAIN')
-    // return `https://${cloudFrontDomain}/${key}`
+  /**
+   * Generate presigned GET URL — cho phép truy cập file private trong thời gian giới hạn (mặc định 24h).
+   * Dùng khi trả attachment về API (bucket S3 thường private).
+   *
+   * @param responseFilename - Tên file gốc để hiển thị khi download (hỗ trợ tiếng Việt/Unicode).
+   *   S3 trả Content-Disposition với filename*=UTF-8'' theo RFC 5987 → Windows save dialog hiện đúng tên.
+   */
+  async getPresignedGetUrl(
+    key: string,
+    expiresIn = 86400,
+    responseFilename?: string,
+  ): Promise<string> {
+    let responseContentDisposition: string | undefined
+    if (responseFilename) {
+      // RFC 5987: filename*=UTF-8''encoded — trình duyệt hiện đúng tiếng Việt
+      const utf8Encoded = encodeURIComponent(responseFilename)
+      const asciiFallback = this.toAsciiFilename(responseFilename)
+      responseContentDisposition = `attachment; filename="${asciiFallback}"; filename*=UTF-8''${utf8Encoded}`
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      ...(responseContentDisposition && {
+        ResponseContentDisposition: responseContentDisposition,
+      }),
+    })
+    return getSignedUrl(this.s3Client, command, { expiresIn })
+  }
+
+  /**
+   * Chuyển tên file sang ASCII-only (fallback cho HTTP header — ISO-8859-1)
+   */
+  private toAsciiFilename(fileName: string): string {
+    const ext = fileName.match(/\.[^.]+$/)?.[0] ?? ''
+    const nameWithoutExt = fileName.slice(0, fileName.length - ext.length)
+    const ascii = nameWithoutExt
+      .normalize('NFD')
+      .replace(/\p{Diacritic}/gu, '') // Bỏ dấu: ệ→e, ồ→o, ề→e
+      .replace(/[^a-zA-Z0-9_-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 100)
+    return (ascii || 'file') + ext
+  }
+
+  /**
+   * Kiểm tra URL có phải S3 URL của bucket này không, và trích xuất key
+   */
+  parseS3KeyFromUrl(url: string): string | null {
+    const region = this.config.get<string>('AWS_REGION') ?? ''
+    const escapedBucket = this.bucketName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const escapedRegion = (region ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp(
+      `^https://${escapedBucket}\\.s3\\.${escapedRegion}\\.amazonaws\\.com/(.+)$`,
+    )
+    const match = url.match(pattern)
+    return match ? decodeURIComponent(match[1]) : null
   }
 
   /**
@@ -159,14 +219,6 @@ export class S3Service implements OnModuleInit {
     if (fileSize > this.MAX_FILE_SIZE) {
       throw new BadRequestException(
         `File quá lớn. Max: ${this.MAX_FILE_SIZE / 1024 / 1024}MB`,
-      )
-    }
-
-    // Check extension
-    const ext = fileName.toLowerCase().match(/\.[^.]+$/)?.[0]
-    if (!ext || !this.ALLOWED_EXTENSIONS.includes(ext)) {
-      throw new BadRequestException(
-        `File extension không được hỗ trợ: ${ext}. Allowed: ${this.ALLOWED_EXTENSIONS.join(', ')}`,
       )
     }
   }

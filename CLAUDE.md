@@ -23,10 +23,9 @@
   - Không dùng Redis Streams cho chat chính (latency cao hơn, phức tạp hơn)
 - Rooms: Mỗi channel là một Socket.io room (`channel:${channelId}`)
 - Events chính:
-  - client → server: message, typing:start, typing:stop, reaction:add, join-channel
-  - server → client: message, typing, presence:update, reaction, unread:count
+  - client → server: message, reaction:add, join-channel
+  - server → client: message, presence:update, reaction, unread:count
 - Presence: Redis Set/String với TTL (user:${userId}:online)
-- Typing: Redis key với TTL ngắn (channel:${channelId}:typing:${userId})
 ## Messages & Storage
 - Lưu trữ chính: PostgreSQL (Neon) + Drizzle
 - Real-time: Redis Pub/Sub broadcast (không lưu messages vào Redis)

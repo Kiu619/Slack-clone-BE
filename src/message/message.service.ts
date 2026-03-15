@@ -21,6 +21,7 @@ import {
 } from '../database/schema'
 import { RedisService } from '../redis/redis.service'
 import { AttachmentService } from '../attachment/attachment.service'
+import { S3Service } from '../upload/s3.service'
 import type {
   CreateMessageDto,
   UpdateMessageDto,
@@ -42,7 +43,29 @@ export class MessageService {
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly redis: RedisService,
     private readonly attachmentService: AttachmentService,
+    private readonly s3Service: S3Service,
   ) {}
+
+  /**
+   * Chuyển S3 URL thành presigned GET URL (bucket private → cần signed URL để truy cập).
+   * Truyền att.name để Content-Disposition đúng tên tiếng Việt khi download.
+   */
+  private async enrichAttachmentWithSignedUrl<
+    T extends { url: string; name?: string },
+  >(att: T): Promise<T> {
+    const key = this.s3Service.parseS3KeyFromUrl(att.url)
+    if (!key) return att
+    try {
+      const signedUrl = await this.s3Service.getPresignedGetUrl(
+        key,
+        86400,
+        att.name,
+      )
+      return { ...att, url: signedUrl }
+    } catch {
+      return att
+    }
+  }
 
   /**
    * messageCacheKey — tạo Redis key cho cache messages
@@ -53,27 +76,6 @@ export class MessageService {
     return `messages:${channelId}:page1`
   }
 
-  /**
-   * assertChannelAccess — kiểm tra user có quyền đọc/ghi channel này không
-   *
-   * Optimization: dùng 1 JOIN query thay vì 2-3 queries tuần tự.
-   *
-   * Logic:
-   *   - LEFT JOIN workspace_members → nếu null: không phải ws member → 403
-   *   - LEFT JOIN channel_members → chỉ cần nếu channel là private
-   *
-   * SQL tương đương:
-   *   SELECT c.id, c.workspace_id, c.is_private,
-   *          wm.id AS ws_member_id,
-   *          cm.id AS ch_member_id
-   *   FROM channels c
-   *   LEFT JOIN workspace_members wm
-   *     ON wm.workspace_id = c.workspace_id AND wm.user_id = $userId
-   *   LEFT JOIN channel_members cm
-   *     ON cm.channel_id = c.id AND cm.user_id = $userId
-   *   WHERE c.id = $channelId
-   *   LIMIT 1
-   */
   private async assertChannelAccess(channelId: string, userId: string) {
     const [row] = await this.db
       .select({
@@ -113,21 +115,6 @@ export class MessageService {
     }
   }
 
-  /**
-   * getMessages — cursor-based pagination với Redis cache
-   *
-   * Cursor là createdAt timestamp của message cũ nhất trong trang hiện tại.
-   * Lấy các messages có createdAt < cursor, sort DESC, limit PAGE_SIZE.
-   * → Kết quả: PAGE_SIZE messages cũ hơn cursor, từ mới → cũ.
-   *
-   * Caching strategy:
-   *   - Chỉ cache page 1 (cursor = undefined) — trang hay xem nhất
-   *   - TTL: 30s — giảm DB load khi nhiều user cùng mở 1 channel
-   *   - Invalidate: khi createMessage hoặc deleteMessage
-   *   - Pages tiếp theo (có cursor) không cache vì ít được fetch
-   *
-   * Client reverse lại để hiển thị cũ ở trên, mới ở dưới.
-   */
   async getMessages(channelId: string, userId: string, cursor?: string) {
     await this.assertChannelAccess(channelId, userId)
 
@@ -141,7 +128,6 @@ export class MessageService {
       }
     }
 
-    // Base condition: chỉ lấy messages của channel này
     const whereConditions = cursor
       ? and(
           eq(messages.channelId, channelId),
@@ -235,26 +221,34 @@ export class MessageService {
       return acc
     }, {})
 
-    // Format response
-    const formattedMessages = messageRows.map((row) => ({
-      id: row.id,
-      channelId: row.channelId,
-      content: row.deletedAt ? '' : row.content,
-      type: row.type,
-      parentId: row.parentId,
-      editedAt: row.editedAt?.toISOString() ?? null,
-      deletedAt: row.deletedAt?.toISOString() ?? null,
-      createdAt: row.createdAt.toISOString(),
-      updatedAt: row.updatedAt.toISOString(),
-      user: {
-        id: row.userId,
-        name: row.userName,
-        avatar: row.userAvatar,
-        email: row.userEmail,
-      },
-      reactions: reactionsByMessage[row.id] ?? [],
-      attachments: attachmentsMap.get(row.id) ?? [],
-    }))
+    // Format response — enrich S3 URLs với presigned URL (bucket private)
+    const formattedMessages = await Promise.all(
+      messageRows.map(async (row) => {
+        const atts = attachmentsMap.get(row.id) ?? []
+        const enrichedAtts = await Promise.all(
+          atts.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+        )
+        return {
+          id: row.id,
+          channelId: row.channelId,
+          content: row.deletedAt ? '' : row.content,
+          type: row.type,
+          parentId: row.parentId,
+          editedAt: row.editedAt?.toISOString() ?? null,
+          deletedAt: row.deletedAt?.toISOString() ?? null,
+          createdAt: row.createdAt.toISOString(),
+          updatedAt: row.updatedAt.toISOString(),
+          user: {
+            id: row.userId,
+            name: row.userName,
+            avatar: row.userAvatar,
+            email: row.userEmail,
+          },
+          reactions: reactionsByMessage[row.id] ?? [],
+          attachments: enrichedAtts,
+        }
+      }),
+    )
 
     const result = this.buildMessagesResponse(
       formattedMessages,
@@ -310,15 +304,6 @@ export class MessageService {
     }
   }
 
-  /**
-   * createMessage — lưu message vào DB
-   *
-   * Approach 1 (Normalized): luôn lấy user info từ DB qua JOIN/users table.
-   * Khi user đổi avatar/name → tất cả messages hiển thị fresh data (Slack behavior).
-   *
-   * Performance: dùng Redis cache user profile (TTL 5 phút).
-   * Invalidate cache khi user update profile (nếu có endpoint đó).
-   */
   async createMessage(
     channelId: string,
     userId: string,
@@ -443,6 +428,11 @@ export class MessageService {
       return acc
     }, [])
 
+    // Enrich S3 URLs với presigned URL
+    const enrichedAttachments = await Promise.all(
+      attachmentsList.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+    )
+
     return {
       id: row.id,
       channelId: row.channelId,
@@ -460,7 +450,7 @@ export class MessageService {
         email: row.userEmail,
       },
       reactions: groupedReactions,
-      attachments: attachmentsList,
+      attachments: enrichedAttachments,
     }
   }
 

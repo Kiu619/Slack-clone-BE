@@ -7,7 +7,6 @@ import { GoogleStrategy } from './strategies/google.strategy'
 import { GithubStrategy } from './strategies/github.strategy'
 import { JwtStrategy } from './strategies/jwt.strategy'
 import { JwtRefreshStrategy } from './strategies/jwt-refresh.strategy'
-
 @Module({
   imports: [PassportModule, JwtModule.register({})],
   controllers: [AuthController],

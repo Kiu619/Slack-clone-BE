@@ -16,7 +16,12 @@ import { GoogleOAuthGuard } from './guards/google-oauth.guard'
 import { GithubOAuthGuard } from './guards/github-oauth.guard'
 import { JwtAuthGuard } from './guards/jwt-auth.guard'
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard'
-import { MagicLinkSchema, type MagicLinkDto } from './dto/magic-link.dto'
+import {
+  MagicLinkSchema,
+  MagicLinkVerifySchema,
+  type MagicLinkDto,
+  type MagicLinkVerifyDto,
+} from './dto/magic-link.dto'
 import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe'
 
 @Controller('auth')
@@ -26,13 +31,9 @@ export class AuthController {
     private config: ConfigService,
   ) {}
 
-  // ─── Google OAuth ─────────────────────────────────────────────────────────
-
   @Get('google')
   @UseGuards(GoogleOAuthGuard)
-  googleAuth() {
-    // Passport redirects to Google automatically
-  }
+  googleAuth() {}
 
   @Get('google/callback')
   @UseGuards(GoogleOAuthGuard)
@@ -42,14 +43,12 @@ export class AuthController {
       email: string
       name?: string
       avatar?: string
-      isAway?: boolean
     }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
       user.name,
       user.avatar,
-      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
@@ -57,13 +56,9 @@ export class AuthController {
     )
   }
 
-  // ─── GitHub OAuth ─────────────────────────────────────────────────────────
-
   @Get('github')
   @UseGuards(GithubOAuthGuard)
-  githubAuth() {
-    // Passport redirects to GitHub automatically
-  }
+  githubAuth() {}
 
   @Get('github/callback')
   @UseGuards(GithubOAuthGuard)
@@ -73,22 +68,18 @@ export class AuthController {
       email: string
       name?: string
       avatar?: string
-      isAway?: boolean
     }
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
       user.name,
       user.avatar,
-      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     res.redirect(
       `${this.config.get('FRONTEND_URL')}/auth/callback?success=true`,
     )
   }
-
-  // ─── Magic Link ───────────────────────────────────────────────────────────
 
   @Post('magic-link/send')
   @HttpCode(HttpStatus.OK)
@@ -102,66 +93,56 @@ export class AuthController {
   @Post('magic-link/verify')
   @HttpCode(HttpStatus.OK)
   async verifyMagicLink(
-    @Body('token') token: string,
+    @Body(new ZodValidationPipe(MagicLinkVerifySchema)) dto: MagicLinkVerifyDto,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const user = await this.authService.verifyMagicLink(token)
+    const user = await this.authService.verifyMagicLink(dto.token)
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
       user.name,
       user.avatar,
-      user.isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
-    return {
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatar: user.avatar,
-        isAway: user.isAway,
-      },
-    }
+    const account = await this.authService.getAccountById(user.id)
+    return { user: account }
   }
-
-  // ─── Token Management ─────────────────────────────────────────────────────
 
   @Post('refresh')
   @UseGuards(JwtRefreshGuard)
   @HttpCode(HttpStatus.OK)
   refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
-    const { userId, email, name, avatar, isAway } = req.user as {
-      userId: string
+    const { id, email, name, avatar } = req.user as {
+      id: string
       email: string
-      name?: string
-      avatar?: string
-      isAway?: boolean
+      name?: string | null
+      avatar?: string | null
     }
     const { accessToken, refreshToken } = this.authService.generateTokens(
-      userId,
+      id,
       email,
       name,
       avatar,
-      isAway,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return { message: 'Tokens refreshed' }
   }
 
-  @Post('logout')
+  @Post('sign-out')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
-  logout(@Res({ passthrough: true }) res: Response) {
+  signOut(@Res({ passthrough: true }) res: Response) {
     this.authService.clearTokenCookies(res)
-    return { message: 'Logged out successfully' }
+    return { message: 'Signed out successfully' }
   }
 
-  // ─── Current User ─────────────────────────────────────────────────────────
-
+  /** Chỉ thông tin tài khoản (email, default name/avatar). Profile workspace: `GET user-profile/me?workspaceId=` */
   @Get('me')
   @UseGuards(JwtAuthGuard)
-  getMe(@Req() req: Request) {
-    return req.user
+  async getMe(@Req() req: Request) {
+    const { id: userId } = req.user as { id: string }
+    const account = await this.authService.getAccountById(userId)
+    if (!account) return null
+    return account
   }
 }

@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
@@ -211,13 +211,21 @@ export class ChannelService {
     return this.db
       .select({
         id: users.id,
-        name: users.name,
+        name: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        displayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         email: users.email,
-        avatar: users.avatar,
+        avatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
         joinedAt: channelMembers.joinedAt,
       })
       .from(channelMembers)
       .innerJoin(users, eq(channelMembers.userId, users.id))
+      .innerJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, users.id),
+          eq(workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
       .where(eq(channelMembers.channelId, channelId))
   }
 }

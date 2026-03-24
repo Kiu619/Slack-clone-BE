@@ -6,11 +6,12 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common'
-import { eq, and } from 'drizzle-orm'
+import { eq, and, sql } from 'drizzle-orm'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import { workspaces, workspaceMembers, users } from '../database/schema'
 import { MailService } from '../mail/mail.service'
 import type { CreateWorkspaceDto } from './dto/create-workspace.dto'
+import type { UpdateMemberStatusDto } from './dto/update-member-status.dto'
 
 @Injectable()
 export class WorkspaceService {
@@ -35,9 +36,8 @@ export class WorkspaceService {
       )
     }
 
-    // Get creator info for invite emails
     const [creator] = await this.db
-      .select({ name: users.name, email: users.email })
+      .select({ name: users.name, email: users.email, avatar: users.avatar })
       .from(users)
       .where(eq(users.id, userId))
       .limit(1)
@@ -52,11 +52,12 @@ export class WorkspaceService {
       })
       .returning()
 
-    // Add creator as owner
     await this.db.insert(workspaceMembers).values({
       workspaceId: workspace.id,
       userId,
       role: 'owner',
+      name: creator?.name ?? null,
+      avatar: creator?.avatar ?? null,
     })
 
     // Send invite emails to memberEmails (fire-and-forget, don't block response)
@@ -66,9 +67,7 @@ export class WorkspaceService {
         inviterName: creator?.name ?? creator?.email ?? 'Someone',
         workspaceName: workspace.name,
         inviteCode: workspace.inviteCode,
-      }).catch((err) =>
-        this.logger.error('Error sending invite emails', err),
-      )
+      }).catch((err) => this.logger.error('Error sending invite emails', err))
     }
 
     return workspace
@@ -80,8 +79,7 @@ export class WorkspaceService {
     workspaceName: string
     inviteCode: string
   }) {
-    const frontendUrl =
-      process.env.FRONTEND_URL ?? 'http://localhost:3045'
+    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3045'
     const inviteUrl = `${frontendUrl}/join/${params.inviteCode}`
 
     const results = await Promise.allSettled(
@@ -146,7 +144,14 @@ export class WorkspaceService {
 
   async findOne(workspaceId: string, userId: string) {
     const [row] = await this.db
-      .select({ workspace: workspaces, role: workspaceMembers.role })
+      .select({
+        workspace: workspaces,
+        role: workspaceMembers.role,
+        statusText: workspaceMembers.statusText,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
+      })
       .from(workspaces)
       .innerJoin(
         workspaceMembers,
@@ -162,7 +167,14 @@ export class WorkspaceService {
       throw new NotFoundException('Workspace not found or you are not a member')
     }
 
-    return { ...row.workspace, role: row.role }
+    return {
+      ...row.workspace,
+      role: row.role,
+      statusText: row.statusText,
+      statusEmoji: row.statusEmoji,
+      statusExpiration: row.statusExpiration,
+      notificationsPausedUntil: row.notificationsPausedUntil,
+    }
   }
 
   async joinByInviteCode(userId: string, inviteCode: string) {
@@ -191,10 +203,18 @@ export class WorkspaceService {
       throw new ConflictException('You are already a member of this workspace')
     }
 
+    const [joinUser] = await this.db
+      .select({ name: users.name, avatar: users.avatar })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+
     await this.db.insert(workspaceMembers).values({
       workspaceId: workspace.id,
       userId,
       role: 'member',
+      name: joinUser?.name ?? null,
+      avatar: joinUser?.avatar ?? null,
     })
 
     return workspace
@@ -219,14 +239,135 @@ export class WorkspaceService {
     return this.db
       .select({
         id: users.id,
-        name: users.name,
+        name: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        displayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         email: users.email,
-        avatar: users.avatar,
+        avatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        statusText: workspaceMembers.statusText,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
         role: workspaceMembers.role,
         joinedAt: workspaceMembers.joinedAt,
       })
       .from(workspaceMembers)
       .innerJoin(users, eq(workspaceMembers.userId, users.id))
       .where(eq(workspaceMembers.workspaceId, workspaceId))
+  }
+
+  async getMemberStatus(
+    workspaceId: string,
+    targetUserId: string,
+    requestingUserId: string,
+  ) {
+    // Verify requesting user is a member of the workspace
+    const [membership] = await this.db
+      .select({ id: workspaceMembers.id })
+      .from(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, requestingUserId),
+        ),
+      )
+      .limit(1)
+
+    if (!membership) {
+      throw new ForbiddenException('You are not a member of this workspace')
+    }
+
+    const [row] = await this.db
+      .select({
+        id: users.id,
+        name: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        displayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        email: users.email,
+        avatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        isAway: workspaceMembers.isAway,
+        namePronunciation: workspaceMembers.namePronunciation,
+        phone: workspaceMembers.phone,
+        description: workspaceMembers.description,
+        timeZone: workspaceMembers.timeZone,
+        status: workspaceMembers.status,
+        statusText: workspaceMembers.statusText,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
+      })
+      .from(workspaceMembers)
+      .innerJoin(users, eq(workspaceMembers.userId, users.id))
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, targetUserId),
+        ),
+      )
+      .limit(1)
+
+    if (!row) {
+      throw new NotFoundException('Member not found in this workspace')
+    }
+
+    return row
+  }
+
+  async updateMemberStatus(
+    userId: string,
+    workspaceId: string,
+    dto: UpdateMemberStatusDto,
+  ) {
+    const [updated] = await this.db
+      .update(workspaceMembers)
+      .set({
+        ...(dto.statusText !== undefined && { statusText: dto.statusText }),
+        ...(dto.statusEmoji !== undefined && { statusEmoji: dto.statusEmoji }),
+        ...(dto.statusExpiration !== undefined && {
+          statusExpiration: dto.statusExpiration
+            ? new Date(dto.statusExpiration)
+            : null,
+        }),
+        ...(dto.notificationsPausedUntil !== undefined && {
+          notificationsPausedUntil: dto.notificationsPausedUntil
+            ? new Date(dto.notificationsPausedUntil)
+            : null,
+        }),
+      })
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
+      .returning()
+
+    if (!updated) {
+      throw new NotFoundException('Workspace member not found')
+    }
+
+    return updated
+  }
+
+  async clearMemberStatus(userId: string, workspaceId: string) {
+    const [updated] = await this.db
+      .update(workspaceMembers)
+      .set({
+        statusText: null,
+        statusEmoji: null,
+        statusExpiration: null,
+        notificationsPausedUntil: null,
+      })
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
+      .returning()
+
+    if (!updated) {
+      throw new NotFoundException('Workspace member not found')
+    }
+
+    return updated
   }
 }

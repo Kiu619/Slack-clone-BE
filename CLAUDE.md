@@ -7,32 +7,13 @@
 - Resend — transactional email
 - Zod — validation
 ## Conventions
-- Nghiêm cấm chỉnh sửa file env (muốn gì thì phải hỏi)
 - Mỗi feature là 1 module: module.ts, service.ts, controller.ts, dto/
 - DTOs dùng Zod schema + ZodValidationPipe
-- Business logic vào Service, HTTP logic vào Controller
 - Tất cả routes cần JwtAuthGuard trừ /auth/*
 - Database queries dùng Drizzle (không dùng raw SQL trừ migration)
 ## Database
 - Schema định nghĩa tại src/database/schema.ts
 - Migration: tạo script tại scripts/migrate-*.mjs (không dùng drizzle-kit push để tránh conflict với migration history)
-## Real-time Communication
-- WebSocket: @nestjs/websockets + Socket.io
-- Scaling: Redis Pub/Sub qua @socket.io/redis-adapter (Upstash)
-  - Lý do: Horizontal scaling (nhiều instance NestJS), broadcast channel messages, typing, presence
-  - Không dùng Redis Streams cho chat chính (latency cao hơn, phức tạp hơn)
-- Rooms: Mỗi channel là một Socket.io room (`channel:${channelId}`)
-- Events chính:
-  - client → server: message, reaction:add, join-channel
-  - server → client: message, presence:update, reaction, unread:count
-- Presence: Redis Set/String với TTL (user:${userId}:online)
-## Messages & Storage
-- Lưu trữ chính: PostgreSQL (Neon) + Drizzle
-- Real-time: Redis Pub/Sub broadcast (không lưu messages vào Redis)
-- Cache: 
-  - Recent messages per channel: Redis Sorted Set (ZADD với score = timestamp) — TTL 1-24h
-  - Unread counts: Redis Hash/INCR (user:${userId}:unread:${channelId})
-- Search: PostgreSQL full-text search (to_tsvector) + trigram extension nếu cần fuzzy search
 ## File Upload & Attachments
 - Storage: Cloudinary (ảnh/video, auto-optimize) + AWS S3 (file chung, PDF/doc...)
   - Lý do: Cloudinary miễn phí tier tốt cho media, S3 rẻ cho file lớn
@@ -50,8 +31,3 @@
 - Logging: Pino hoặc NestJS logger + Sentry (error tracking)
 ## Performance
 - Luôn luôn viết code một cách tối ưu hiệu suất nhất có thể (áp dụng các kỹ thuật tối ưu)
-## Testing
-- Unit: Jest + @nestjs/testing cho services
-- E2E: Supertest + Jest cho controllers + WebSocket testing (socket.io-client)
-- Coverage goal: >80% cho business logic
-- Mock: Redis mock (ioredis-mock), Drizzle mock (drizzle-orm/mocks)

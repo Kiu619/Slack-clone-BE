@@ -18,6 +18,7 @@ export const channelTypeEnum = pgEnum('channel_type', [
   'video',
 ])
 
+/** Tài khoản: email + default hiển thị (OAuth) khi seed workspace_members */
 export const users = pgTable('users', {
   id: text('id')
     .primaryKey()
@@ -25,7 +26,6 @@ export const users = pgTable('users', {
   email: text('email').notNull().unique(),
   name: text('name'),
   avatar: text('avatar'),
-  isAway: boolean('is_away').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at')
     .defaultNow()
@@ -61,8 +61,8 @@ export const workspaces = pgTable(
       .primaryKey()
       .$defaultFn(() => randomUUID()),
     name: text('name').notNull(),
-    slug: text('slug').notNull().unique(),
-    inviteCode: text('invite_code').notNull().unique(),
+    slug: text('slug').notNull(),
+    inviteCode: text('invite_code').notNull(),
     imageUrl: text('image_url').notNull().default(''),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
@@ -93,6 +93,20 @@ export const workspaceMembers = pgTable(
       .notNull()
       .default('member'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
+    /** Profile trong workspace (Slack-style) */
+    name: text('name'),
+    displayName: text('display_name'),
+    avatar: text('avatar'),
+    isAway: boolean('is_away').notNull().default(false),
+    status: text('status'),
+    namePronunciation: text('name_pronunciation'),
+    phone: text('phone'),
+    description: text('description'),
+    timeZone: text('time_zone'),
+    statusText: text('status_text'),
+    statusEmoji: text('status_emoji'),
+    statusExpiration: timestamp('status_expiration'),
+    notificationsPausedUntil: timestamp('notifications_paused_until'),
   },
   (table) => [
     uniqueIndex('workspace_members_unique').on(table.workspaceId, table.userId),

@@ -31,13 +31,13 @@ export class ChannelController {
     @Req() req: Request,
     @Body(new ZodValidationPipe(CreateChannelSchema)) dto: CreateChannelDto,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.channelService.create(workspaceId, userId, dto)
   }
 
   @Get()
   findAll(@Param('workspaceId') workspaceId: string, @Req() req: Request) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.channelService.findAllByWorkspace(workspaceId, userId)
   }
 
@@ -47,7 +47,7 @@ export class ChannelController {
     @Param('channelId') channelId: string,
     @Req() req: Request,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.channelService.findOne(channelId, workspaceId, userId)
   }
 
@@ -58,7 +58,7 @@ export class ChannelController {
     @Param('channelId') channelId: string,
     @Req() req: Request,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.channelService.delete(channelId, workspaceId, userId)
   }
 
@@ -68,7 +68,7 @@ export class ChannelController {
     @Param('channelId') channelId: string,
     @Req() req: Request,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.channelService.getMembers(channelId, workspaceId, userId)
   }
 }

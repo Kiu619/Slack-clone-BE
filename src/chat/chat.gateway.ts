@@ -86,9 +86,8 @@ export class ChatGateway
   /**
    * handleConnection — chạy khi client kết nối WebSocket
    *
-   * Optimization: không query DB — đọc userId và userName trực tiếp
-   * từ JWT payload (payload.sub và payload.name đã được set khi tạo token).
-   * Tiết kiệm 1 DB query mỗi kết nối → quan trọng khi 50-100 users.
+   * userId + **default** name/avatar từ JWT (bảng users, không phải profile workspace).
+   * Tên theo workspace lấy từ payload message / API channels.
    */
   handleConnection(client: Socket) {
     try {

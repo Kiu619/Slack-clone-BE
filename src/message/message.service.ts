@@ -7,7 +7,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common'
-import { and, desc, eq, inArray, lt } from 'drizzle-orm'
+import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
@@ -73,7 +73,7 @@ export class MessageService {
    * khi user mở channel.
    */
   private messageCacheKey(channelId: string): string {
-    return `messages:${channelId}:page1`
+    return `messages:v2:${channelId}:page1`
   }
 
   private async assertChannelAccess(channelId: string, userId: string) {
@@ -147,14 +147,28 @@ export class MessageService {
         deletedAt: messages.deletedAt,
         createdAt: messages.createdAt,
         updatedAt: messages.updatedAt,
-        // User fields (join)
         userId: users.id,
-        userName: users.name,
-        userAvatar: users.avatar,
         userEmail: users.email,
+        userName: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.status,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userPhone: workspaceMembers.phone,
+        userDescription: workspaceMembers.description,
+        userTimeZone: workspaceMembers.timeZone,
       })
       .from(messages)
+      .innerJoin(channels, eq(messages.channelId, channels.id))
       .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
       .where(whereConditions)
       .orderBy(desc(messages.createdAt))
       .limit(PAGE_SIZE + 1)) as Array<{
@@ -168,9 +182,16 @@ export class MessageService {
       createdAt: Date
       updatedAt: Date
       userId: string
-      userName: string | null
-      userAvatar: string | null
       userEmail: string
+      userName: string | null
+      userDisplayName: string | null
+      userAvatar: string | null
+      userIsAway: boolean | null
+      userStatus: string | null
+      userNamePronunciation: string | null
+      userPhone: string | null
+      userDescription: string | null
+      userTimeZone: string | null
     }>
 
     const hasMore = rows.length > PAGE_SIZE
@@ -243,6 +264,13 @@ export class MessageService {
             name: row.userName,
             avatar: row.userAvatar,
             email: row.userEmail,
+            displayName: row.userDisplayName,
+            isAway: row.userIsAway,
+            status: row.userStatus,
+            namePronunciation: row.userNamePronunciation,
+            phone: row.userPhone,
+            description: row.userDescription,
+            timeZone: row.userTimeZone,
           },
           reactions: reactionsByMessage[row.id] ?? [],
           attachments: enrichedAtts,
@@ -288,6 +316,13 @@ export class MessageService {
         name: string | null
         avatar: string | null
         email: string
+        displayName: string | null
+        isAway: boolean | null
+        status: string | null
+        namePronunciation: string | null
+        phone: string | null
+        description: string | null
+        timeZone: string | null
       }
       reactions: { emoji: string; count: number; userIds: string[] }[]
       attachments: Array<typeof attachments.$inferSelect>
@@ -309,7 +344,7 @@ export class MessageService {
     userId: string,
     dto: CreateMessageDto,
   ) {
-    await this.assertChannelAccess(channelId, userId)
+    const { workspaceId } = await this.assertChannelAccess(channelId, userId)
 
     const [message] = (await this.db
       .insert(messages)
@@ -337,8 +372,7 @@ export class MessageService {
     // Invalidate page 1 cache vì có message mới → cache cũ sẽ thiếu message này
     await this.redis.del(this.messageCacheKey(channelId))
 
-    // Lấy user info từ DB (với Redis cache) → avatar/name luôn fresh
-    const user = await this.getUserProfile(userId)
+    const user = await this.getAuthorProfileForWorkspace(userId, workspaceId)
 
     return {
       ...message,
@@ -370,12 +404,27 @@ export class MessageService {
         createdAt: messages.createdAt,
         updatedAt: messages.updatedAt,
         userId: users.id,
-        userName: users.name,
-        userAvatar: users.avatar,
         userEmail: users.email,
+        userName: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.status,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userPhone: workspaceMembers.phone,
+        userDescription: workspaceMembers.description,
+        userTimeZone: workspaceMembers.timeZone,
       })
       .from(messages)
+      .innerJoin(channels, eq(messages.channelId, channels.id))
       .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
       .where(eq(messages.id, messageId))
       .limit(1)) as Array<{
       id: string
@@ -391,6 +440,13 @@ export class MessageService {
       userName: string | null
       userAvatar: string | null
       userEmail: string
+      userDisplayName: string | null
+      userIsAway: boolean | null
+      userStatus: string | null
+      userNamePronunciation: string | null
+      userPhone: string | null
+      userDescription: string | null
+      userTimeZone: string | null
     }>
 
     if (!row) {
@@ -448,6 +504,13 @@ export class MessageService {
         name: row.userName,
         avatar: row.userAvatar,
         email: row.userEmail,
+        displayName: row.userDisplayName,
+        isAway: row.userIsAway,
+        status: row.userStatus,
+        namePronunciation: row.userNamePronunciation,
+        phone: row.userPhone,
+        description: row.userDescription,
+        timeZone: row.userTimeZone,
       },
       reactions: groupedReactions,
       attachments: enrichedAttachments,
@@ -455,12 +518,14 @@ export class MessageService {
   }
 
   /**
-   * getUserProfile — lấy user id, name, avatar, email
-   * Cache trong Redis 5 phút để giảm DB load khi nhiều messages liên tiếp.
-   * Khi có endpoint update profile → gọi redis.del(`user:${userId}:profile`) để invalidate.
+   * Profile tác giả message theo workspace (Slack-style).
+   * Invalidate: redis.del(`ws:${workspaceId}:user:${userId}:profile`) khi sửa workspace profile.
    */
-  private async getUserProfile(userId: string) {
-    const cacheKey = `user:${userId}:profile`
+  private async getAuthorProfileForWorkspace(
+    userId: string,
+    workspaceId: string,
+  ) {
+    const cacheKey = `ws:${workspaceId}:user:${userId}:profile`
     const cached = await this.redis.get(cacheKey)
     if (cached) {
       return JSON.parse(cached) as {
@@ -468,34 +533,63 @@ export class MessageService {
         name: string | null
         avatar: string | null
         email: string
+        displayName: string | null
+        isAway: boolean
+        status: string | null
+        namePronunciation: string | null
+        phone: string | null
+        description: string | null
+        timeZone: string | null
       }
     }
 
-    const [user] = (await this.db
+    const [row] = await this.db
       .select({
         id: users.id,
-        name: users.name,
-        avatar: users.avatar,
         email: users.email,
+        accountName: users.name,
+        accountAvatar: users.avatar,
+        wmName: workspaceMembers.name,
+        wmAvatar: workspaceMembers.avatar,
+        displayName: workspaceMembers.displayName,
+        isAway: workspaceMembers.isAway,
+        status: workspaceMembers.status,
+        namePronunciation: workspaceMembers.namePronunciation,
+        phone: workspaceMembers.phone,
+        description: workspaceMembers.description,
+        timeZone: workspaceMembers.timeZone,
       })
       .from(users)
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, users.id),
+          eq(workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
       .where(eq(users.id, userId))
-      .limit(1)) as Array<{
-      id: string
-      name: string | null
-      avatar: string | null
-      email: string
-    }>
+      .limit(1)
 
-    if (!user) throw new NotFoundException('User not found')
+    if (!row) throw new NotFoundException('User not found')
 
+    const name =
+      row.wmName ?? row.accountName ?? null
+    const avatar =
+      row.wmAvatar ?? row.accountAvatar ?? null
     const profile = {
-      id: user.id,
-      name: user.name ?? null,
-      avatar: user.avatar ?? null,
-      email: user.email,
+      id: row.id,
+      name,
+      avatar,
+      email: row.email,
+      displayName: row.displayName ?? name,
+      isAway: row.isAway ?? false,
+      status: row.status ?? null,
+      namePronunciation: row.namePronunciation ?? null,
+      phone: row.phone ?? null,
+      description: row.description ?? null,
+      timeZone: row.timeZone ?? null,
     }
-    await this.redis.set(cacheKey, JSON.stringify(profile), 300) // TTL 5 phút
+    await this.redis.set(cacheKey, JSON.stringify(profile), 300)
     return profile
   }
 

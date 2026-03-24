@@ -14,6 +14,7 @@ import { MessageModule } from './message/message.module'
 import { ChatModule } from './chat/chat.module'
 import { UploadModule } from './upload/upload.module'
 import { AttachmentModule } from './attachment/attachment.module'
+import { UserProfileModule } from './user-profile/user-profile.module'
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AttachmentModule } from './attachment/attachment.module'
     RedisModule,
     MailModule,
     AuthModule,
+    UserProfileModule,
     WorkspaceModule,
     ChannelModule,
     MessageModule,

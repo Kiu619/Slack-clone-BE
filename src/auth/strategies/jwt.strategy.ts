@@ -9,7 +9,6 @@ export interface JwtPayload {
   email: string
   name?: string | null
   avatar?: string | null
-  isAway?: boolean
 }
 
 @Injectable()
@@ -26,11 +25,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
 
   validate(payload: JwtPayload) {
     return {
-      userId: payload.sub,
+      id: payload.sub,
       email: payload.email,
       name: payload.name ?? null,
       avatar: payload.avatar ?? null,
-      isAway: payload.isAway ?? false,
     }
   }
 }

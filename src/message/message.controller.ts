@@ -47,7 +47,7 @@ export class MessageController {
     @Query('cursor') cursor: string | undefined,
     @Req() req: Request,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.messageService.getMessages(channelId, userId, cursor)
   }
 
@@ -58,7 +58,7 @@ export class MessageController {
   @Get('messages/:messageId')
   @SkipThrottle({ message: true })
   getMessageById(@Param('messageId') messageId: string, @Req() req: Request) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.messageService.getMessageById(messageId, userId)
   }
 
@@ -84,7 +84,7 @@ export class MessageController {
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     const message = await this.messageService.createMessage(
       channelId,
       userId,
@@ -104,7 +104,7 @@ export class MessageController {
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     const updated = await this.messageService.updateMessage(
       messageId,
       userId,
@@ -125,7 +125,7 @@ export class MessageController {
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     const result = await this.messageService.deleteMessage(messageId, userId)
     this.broadcastService.broadcastMessageDeleted(
       result.channelId,
@@ -143,7 +143,7 @@ export class MessageController {
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     const result = await this.messageService.toggleReaction(
       messageId,
       userId,

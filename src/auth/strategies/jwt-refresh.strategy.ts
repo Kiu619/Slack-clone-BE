@@ -1,16 +1,20 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return */
-import { Injectable } from '@nestjs/common'
+import { Injectable, UnauthorizedException } from '@nestjs/common'
 import { PassportStrategy } from '@nestjs/passport'
 import { ExtractJwt, Strategy } from 'passport-jwt'
 import { ConfigService } from '@nestjs/config'
 import { Request } from 'express'
+import { AuthService } from '../auth.service'
 
 @Injectable()
 export class JwtRefreshStrategy extends PassportStrategy(
   Strategy,
   'jwt-refresh',
 ) {
-  constructor(config: ConfigService) {
+  constructor(
+    config: ConfigService,
+    private readonly authService: AuthService,
+  ) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
         (req: Request) => req?.cookies?.refresh_token ?? null,
@@ -20,19 +24,14 @@ export class JwtRefreshStrategy extends PassportStrategy(
     })
   }
 
-  validate(payload: {
-    sub: string
-    email: string
-    name?: string | null
-    avatar?: string | null
-    isAway?: boolean
-  }) {
+  async validate(payload: { sub: string; email: string }) {
+    const user = await this.authService.getAccountById(payload.sub)
+    if (!user) throw new UnauthorizedException()
     return {
-      userId: payload.sub,
-      email: payload.email,
-      name: payload.name ?? null,
-      avatar: payload.avatar ?? null,
-      isAway: payload.isAway ?? false,
+      id: user.id,
+      email: user.email,
+      name: user.name ?? null,
+      avatar: user.avatar ?? null,
     }
   }
 }

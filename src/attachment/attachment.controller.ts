@@ -33,7 +33,7 @@ export class AttachmentController {
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
 
     const attachment = await this.attachmentService.createAttachment(dto)
 
@@ -53,7 +53,7 @@ export class AttachmentController {
 
   @Delete(':id')
   async deleteAttachment(@Param('id') id: string, @Req() req: Request) {
-    const { userId } = req.user as { userId: string }
+    const { id: userId } = req.user as { id: string }
     return this.attachmentService.deleteAttachment(id, userId)
   }
 }

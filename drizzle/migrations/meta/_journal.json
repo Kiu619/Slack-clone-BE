@@ -15,6 +15,20 @@
       "when": 1772796869127,
       "tag": "0001_fair_spirit",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1742054400000,
+      "tag": "0002_add_user_profile_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1742505600000,
+      "tag": "0003_workspace_member_profile",
+      "breakpoints": true
     }
   ]
 }

@@ -60,7 +60,11 @@ export class AuthService {
     if (!user) {
       ;[user] = await this.db
         .insert(users)
-        .values({ email, name: name ?? null, avatar: avatar ?? null })
+        .values({
+          email,
+          name: name ?? null,
+          avatar: avatar ?? null,
+        })
         .returning()
     }
 
@@ -108,30 +112,21 @@ export class AuthService {
   }
 
   /**
-   * generateTokens — tạo JWT access + refresh token
-   *
-   * Access token payload chứa { sub, email, name, avatar } để:
-   *   - ChatGateway đọc userName mà không cần query DB khi WS connect
-   *   - MessageController truyền userInfo đầy đủ (kể cả avatar) vào createMessage
-   *
-   * Trade-off: avatar URL trong token sẽ stale nếu user thay avatar.
-   * Acceptable vì: token expire sau 30d, và avatar change rất ít khi xảy ra.
-   * Nếu cần real-time avatar update → bỏ avatar ra khỏi JWT, query DB mỗi lần.
+   * Access token: sub, email, name, avatar — chỉ **default tài khoản** (bảng users).
+   * Tên/avatar theo workspace lấy từ API workspace / messages, không nằm trong JWT.
    */
   generateTokens(
-    userId: string,
+    id: string,
     email: string,
     name?: string | null,
     avatar?: string | null,
-    isAway?: boolean,
   ) {
     const accessToken = this.jwt.sign(
       {
-        sub: userId,
+        sub: id,
         email,
         name: name ?? null,
         avatar: avatar ?? null,
-        isAway,
       },
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
@@ -140,7 +135,7 @@ export class AuthService {
     )
 
     const refreshToken = this.jwt.sign(
-      { sub: userId, email },
+      { sub: id, email },
       {
         secret: this.config.getOrThrow<string>('JWT_REFRESH_SECRET'),
         expiresIn: this.config.get('JWT_REFRESH_EXPIRATION') ?? '90d',
@@ -176,5 +171,20 @@ export class AuthService {
   clearTokenCookies(res: Response): void {
     res.clearCookie('access_token')
     res.clearCookie('refresh_token', { path: '/auth/refresh' })
+  }
+
+  /** Hồ sơ tài khoản (không gồm profile theo workspace) */
+  async getAccountById(userId: string) {
+    const [user] = await this.db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        avatar: users.avatar,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+    return user ?? null
   }
 }

@@ -33,7 +33,7 @@ const WorkspaceIdSchema = z.string().uuid('workspaceId must be a valid UUID')
 @Controller('user-profile')
 @UseGuards(JwtAuthGuard)
 export class UserProfileController {
-  constructor(private readonly userProfileService: UserProfileService) {}
+  constructor(private readonly userProfileService: UserProfileService) { }
 
   private parseWorkspaceId(raw: string | undefined): string {
     if (!raw?.trim()) {

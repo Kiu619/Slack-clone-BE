@@ -107,6 +107,7 @@ export const workspaceMembers = pgTable(
     statusEmoji: text('status_emoji'),
     statusExpiration: timestamp('status_expiration'),
     notificationsPausedUntil: timestamp('notifications_paused_until'),
+    theme: text('theme'),
   },
   (table) => [
     uniqueIndex('workspace_members_unique').on(table.workspaceId, table.userId),

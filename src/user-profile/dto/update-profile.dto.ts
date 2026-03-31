@@ -26,6 +26,7 @@ export const UpdateProfileSchema = z
     avatar: optionalUrl,
     isAway: z.boolean().optional(),
     status: optionalString,
+    theme: optionalString,
   })
   .partial()
 

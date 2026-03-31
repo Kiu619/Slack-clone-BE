@@ -17,7 +17,7 @@ export class UserProfileService {
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly redis: RedisService,
-  ) {}
+  ) { }
 
   private async assertWorkspaceMember(workspaceId: string, userId: string) {
     const [m] = await this.db
@@ -66,6 +66,7 @@ export class UserProfileService {
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        theme: workspaceMembers.theme,
       })
       .from(users)
       .innerJoin(
@@ -102,6 +103,7 @@ export class UserProfileService {
         ...(dto.avatar !== undefined && { avatar: dto.avatar }),
         ...(dto.isAway !== undefined && { isAway: dto.isAway }),
         ...(dto.status !== undefined && { status: dto.status }),
+        ...(dto.theme !== undefined && { theme: dto.theme }),
       })
       .where(
         and(
@@ -130,6 +132,7 @@ export class UserProfileService {
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        theme: workspaceMembers.theme,
       })
       .from(users)
       .innerJoin(
@@ -185,6 +188,7 @@ export class UserProfileService {
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        theme: workspaceMembers.theme,
       })
       .from(users)
       .innerJoin(
@@ -240,6 +244,7 @@ export class UserProfileService {
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        theme: workspaceMembers.theme,
       })
       .from(users)
       .innerJoin(
@@ -270,6 +275,7 @@ export class UserProfileService {
     phone: string | null
     description: string | null
     timeZone: string | null
+    theme: string | null
   }) {
     const name = row.wmName ?? row.accountName ?? null
     const avatar = row.wmAvatar ?? row.accountAvatar ?? null
@@ -285,6 +291,7 @@ export class UserProfileService {
       phone: row.phone,
       description: row.description,
       timeZone: row.timeZone,
+      theme: row.theme,
     }
   }
 }

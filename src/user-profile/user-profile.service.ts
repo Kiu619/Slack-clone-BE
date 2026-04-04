@@ -11,12 +11,14 @@ import type { UpdateProfileDto } from './dto/update-profile.dto'
 import type { UpdateContactDto } from './dto/update-contact.dto'
 import type { UpdateAboutMeDto } from './dto/update-about-me.dto'
 import { RedisService } from '../redis/redis.service'
+import { UserProfileBroadcastService } from './user-profile-broadcast.service'
 
 @Injectable()
 export class UserProfileService {
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly redis: RedisService,
+    private readonly profileBroadcastService: UserProfileBroadcastService,
   ) { }
 
   private async assertWorkspaceMember(workspaceId: string, userId: string) {
@@ -61,12 +63,15 @@ export class UserProfileService {
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
         isAway: workspaceMembers.isAway,
-        status: workspaceMembers.status,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
         theme: workspaceMembers.theme,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        statusText: workspaceMembers.statusText,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
       })
       .from(users)
       .innerJoin(
@@ -127,11 +132,14 @@ export class UserProfileService {
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
         isAway: workspaceMembers.isAway,
-        status: workspaceMembers.status,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        statusText: workspaceMembers.statusText,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
         theme: workspaceMembers.theme,
       })
       .from(users)
@@ -146,7 +154,12 @@ export class UserProfileService {
       .limit(1)
 
     if (!row) throw new NotFoundException('User not found')
-    return { ...this.toPublicProfile(row), workspaceId }
+    const publicProfile = this.toPublicProfile(row)
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      ...publicProfile,
+      workspaceId,
+    })
+    return { ...publicProfile, workspaceId }
   }
 
   async updateContact(
@@ -183,11 +196,14 @@ export class UserProfileService {
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
         isAway: workspaceMembers.isAway,
-        status: workspaceMembers.status,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        statusText: workspaceMembers.statusText,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
         theme: workspaceMembers.theme,
       })
       .from(users)
@@ -202,7 +218,12 @@ export class UserProfileService {
       .limit(1)
 
     if (!row) throw new NotFoundException('User not found')
-    return { ...this.toPublicProfile(row), workspaceId }
+    const publicProfile = this.toPublicProfile(row)
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      ...publicProfile,
+      workspaceId,
+    })
+    return { ...publicProfile, workspaceId }
   }
 
   async updateAboutMe(
@@ -239,11 +260,14 @@ export class UserProfileService {
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
         isAway: workspaceMembers.isAway,
-        status: workspaceMembers.status,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
+        statusEmoji: workspaceMembers.statusEmoji,
+        statusExpiration: workspaceMembers.statusExpiration,
+        statusText: workspaceMembers.statusText,
+        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
         theme: workspaceMembers.theme,
       })
       .from(users)
@@ -258,7 +282,12 @@ export class UserProfileService {
       .limit(1)
 
     if (!row) throw new NotFoundException('User not found')
-    return { ...this.toPublicProfile(row), workspaceId }
+    const publicProfile = this.toPublicProfile(row)
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      ...publicProfile,
+      workspaceId,
+    })
+    return { ...publicProfile, workspaceId }
   }
 
   private toPublicProfile(row: {
@@ -270,11 +299,14 @@ export class UserProfileService {
     wmAvatar: string | null
     displayName: string | null
     isAway: boolean
-    status: string | null
     namePronunciation: string | null
     phone: string | null
     description: string | null
     timeZone: string | null
+    statusEmoji: string | null
+    statusExpiration: Date | null
+    statusText: string | null
+    notificationsPausedUntil: Date | null
     theme: string | null
   }) {
     const name = row.wmName ?? row.accountName ?? null
@@ -286,11 +318,14 @@ export class UserProfileService {
       displayName: row.displayName ?? name,
       avatar,
       isAway: row.isAway,
-      status: row.status,
       namePronunciation: row.namePronunciation,
       phone: row.phone,
       description: row.description,
       timeZone: row.timeZone,
+      statusEmoji: row.statusEmoji,
+      statusExpiration: row.statusExpiration,
+      statusText: row.statusText,
+      notificationsPausedUntil: row.notificationsPausedUntil,
       theme: row.theme,
     }
   }

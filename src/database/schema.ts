@@ -98,7 +98,6 @@ export const workspaceMembers = pgTable(
     displayName: text('display_name'),
     avatar: text('avatar'),
     isAway: boolean('is_away').notNull().default(false),
-    status: text('status'),
     namePronunciation: text('name_pronunciation'),
     phone: text('phone'),
     description: text('description'),

@@ -12,6 +12,7 @@ import { workspaces, workspaceMembers, users } from '../database/schema'
 import { MailService } from '../mail/mail.service'
 import type { CreateWorkspaceDto } from './dto/create-workspace.dto'
 import type { UpdateMemberStatusDto } from './dto/update-member-status.dto'
+import { UserProfileBroadcastService } from '../user-profile/user-profile-broadcast.service'
 
 @Injectable()
 export class WorkspaceService {
@@ -20,6 +21,7 @@ export class WorkspaceService {
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly mail: MailService,
+    private readonly profileBroadcastService: UserProfileBroadcastService,
   ) {}
 
   async create(userId: string, dto: CreateWorkspaceDto) {
@@ -147,10 +149,6 @@ export class WorkspaceService {
       .select({
         workspace: workspaces,
         role: workspaceMembers.role,
-        statusText: workspaceMembers.statusText,
-        statusEmoji: workspaceMembers.statusEmoji,
-        statusExpiration: workspaceMembers.statusExpiration,
-        notificationsPausedUntil: workspaceMembers.notificationsPausedUntil,
       })
       .from(workspaces)
       .innerJoin(
@@ -170,10 +168,6 @@ export class WorkspaceService {
     return {
       ...row.workspace,
       role: row.role,
-      statusText: row.statusText,
-      statusEmoji: row.statusEmoji,
-      statusExpiration: row.statusExpiration,
-      notificationsPausedUntil: row.notificationsPausedUntil,
     }
   }
 
@@ -288,7 +282,6 @@ export class WorkspaceService {
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
         timeZone: workspaceMembers.timeZone,
-        status: workspaceMembers.status,
         statusText: workspaceMembers.statusText,
         statusEmoji: workspaceMembers.statusEmoji,
         statusExpiration: workspaceMembers.statusExpiration,
@@ -344,6 +337,15 @@ export class WorkspaceService {
       throw new NotFoundException('Workspace member not found')
     }
 
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      id: userId,
+      statusText: updated.statusText,
+      statusEmoji: updated.statusEmoji,
+      statusExpiration: updated.statusExpiration,
+      notificationsPausedUntil: updated.notificationsPausedUntil,
+      workspaceId,
+    })
+
     return updated
   }
 
@@ -367,6 +369,15 @@ export class WorkspaceService {
     if (!updated) {
       throw new NotFoundException('Workspace member not found')
     }
+
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      id: userId,
+      statusText: null,
+      statusEmoji: null,
+      statusExpiration: null,
+      notificationsPausedUntil: null,
+      workspaceId,
+    })
 
     return updated
   }

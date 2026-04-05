@@ -100,4 +100,21 @@ export class ChatBroadcastService {
       this.server.to(room).emit('attachment:added', data)
     }
   }
+
+  broadcastAttachmentDeleted(
+    channelId: string,
+    data: { messageId: string; attachmentId: string },
+    excludeSocketId?: string,
+  ) {
+    if (!this.server) return
+    const room = `channel:${channelId}`
+    if (excludeSocketId) {
+      this.server
+        .to(room)
+        .except(excludeSocketId)
+        .emit('attachment:deleted', data)
+    } else {
+      this.server.to(room).emit('attachment:deleted', data)
+    }
+  }
 }

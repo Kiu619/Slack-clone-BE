@@ -150,6 +150,7 @@ export class AttachmentService {
         id: attachments.id,
         messageId: attachments.messageId,
         userId: schema.messages.userId,
+        channelId: schema.messages.channelId,
       })
       .from(attachments)
       .innerJoin(schema.messages, eq(schema.messages.id, attachments.messageId))
@@ -158,6 +159,7 @@ export class AttachmentService {
       id: string
       messageId: string
       userId: string
+      channelId: string
     }>
 
     if (!attachment) {
@@ -173,6 +175,11 @@ export class AttachmentService {
 
     this.logger.log(`Deleted attachment: ${attachmentId}`)
 
-    return { success: true }
+    return { 
+      success: true, 
+      messageId: attachment.messageId, 
+      channelId: attachment.channelId, 
+      attachmentId 
+    }
   }
 }

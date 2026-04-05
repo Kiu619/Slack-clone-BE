@@ -28,7 +28,7 @@ import type {
   AddReactionDto,
 } from './dto/create-message.dto'
 
-const PAGE_SIZE = 50
+const PAGE_SIZE = 20
 
 /**
  * TTL cho Redis message cache (tính bằng giây)

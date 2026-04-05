@@ -52,8 +52,20 @@ export class AttachmentController {
   }
 
   @Delete(':id')
-  async deleteAttachment(@Param('id') id: string, @Req() req: Request) {
+  async deleteAttachment(
+    @Param('id') id: string, 
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
     const { id: userId } = req.user as { id: string }
-    return this.attachmentService.deleteAttachment(id, userId)
+    const result = await this.attachmentService.deleteAttachment(id, userId)
+    
+    void this.broadcastService.broadcastAttachmentDeleted(
+      result.channelId,
+      { messageId: result.messageId, attachmentId: id },
+      socketId,
+    )
+
+    return result
   }
 }

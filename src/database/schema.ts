@@ -267,6 +267,63 @@ export const attachments = pgTable(
   (table) => [index('attachments_message_idx').on(table.messageId)],
 )
 
+/** Folder trong channel (tab Folders) — tên unique trong channel */
+export const channelFolders = pgTable(
+  'channel_folders',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    channelId: text('channel_id')
+      .notNull()
+      .references(() => channels.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    createdById: text('created_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('channel_folders_channel_name_unique').on(
+      table.channelId,
+      table.name,
+    ),
+    index('channel_folders_channel_idx').on(table.channelId),
+  ],
+)
+
+/** Attachment được gắn vào folder (cùng channel với message của attachment) */
+export const folderAttachments = pgTable(
+  'folder_attachments',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    folderId: text('folder_id')
+      .notNull()
+      .references(() => channelFolders.id, { onDelete: 'cascade' }),
+    attachmentId: text('attachment_id')
+      .notNull()
+      .references(() => attachments.id, { onDelete: 'cascade' }),
+    addedById: text('added_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    addedAt: timestamp('added_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('folder_attachments_folder_attachment_unique').on(
+      table.folderId,
+      table.attachmentId,
+    ),
+    index('folder_attachments_folder_idx').on(table.folderId),
+    index('folder_attachments_attachment_idx').on(table.attachmentId),
+  ],
+)
+
 // ─── Relations ────────────────────────────────────────────────────────────────
 
 export const usersRelations = relations(users, ({ many }) => ({
@@ -310,6 +367,7 @@ export const channelsRelations = relations(channels, ({ one, many }) => ({
     references: [users.id],
   }),
   members: many(channelMembers),
+  folders: many(channelFolders),
 }))
 
 export const channelMembersRelations = relations(channelMembers, ({ one }) => ({
@@ -354,12 +412,46 @@ export const reactionsRelations = relations(reactions, ({ one }) => ({
   }),
 }))
 
-export const attachmentsRelations = relations(attachments, ({ one }) => ({
+export const attachmentsRelations = relations(attachments, ({ one, many }) => ({
   message: one(messages, {
     fields: [attachments.messageId],
     references: [messages.id],
   }),
+  folderLinks: many(folderAttachments),
 }))
+
+export const channelFoldersRelations = relations(
+  channelFolders,
+  ({ one, many }) => ({
+    channel: one(channels, {
+      fields: [channelFolders.channelId],
+      references: [channels.id],
+    }),
+    createdBy: one(users, {
+      fields: [channelFolders.createdById],
+      references: [users.id],
+    }),
+    folderAttachments: many(folderAttachments),
+  }),
+)
+
+export const folderAttachmentsRelations = relations(
+  folderAttachments,
+  ({ one }) => ({
+    folder: one(channelFolders, {
+      fields: [folderAttachments.folderId],
+      references: [channelFolders.id],
+    }),
+    attachment: one(attachments, {
+      fields: [folderAttachments.attachmentId],
+      references: [attachments.id],
+    }),
+    addedBy: one(users, {
+      fields: [folderAttachments.addedById],
+      references: [users.id],
+    }),
+  }),
+)
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -379,3 +471,7 @@ export type Reaction = typeof reactions.$inferSelect
 export type NewReaction = typeof reactions.$inferInsert
 export type Attachment = typeof attachments.$inferSelect
 export type NewAttachment = typeof attachments.$inferInsert
+export type ChannelFolder = typeof channelFolders.$inferSelect
+export type NewChannelFolder = typeof channelFolders.$inferInsert
+export type FolderAttachment = typeof folderAttachments.$inferSelect
+export type NewFolderAttachment = typeof folderAttachments.$inferInsert

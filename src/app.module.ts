@@ -14,6 +14,7 @@ import { MessageModule } from './message/message.module'
 import { ChatModule } from './chat/chat.module'
 import { UploadModule } from './upload/upload.module'
 import { AttachmentModule } from './attachment/attachment.module'
+import { FolderModule } from './folder/folder.module'
 import { UserProfileModule } from './user-profile/user-profile.module'
 
 @Module({
@@ -30,6 +31,7 @@ import { UserProfileModule } from './user-profile/user-profile.module'
     ChatModule,
     UploadModule,
     AttachmentModule,
+    FolderModule,
     /**
      * ThrottlerModule — Rate Limiting cho toàn bộ REST API
      *

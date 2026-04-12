@@ -1,13 +1,10 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
 import {
   ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common'
-import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm'
+import { and, desc, eq, ilike, inArray, isNull, lt, or, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
@@ -30,12 +27,48 @@ import type {
 
 const PAGE_SIZE = 20
 
+/** Phân trang tab Files — theo `attachments.createdAt` + `attachments.id` */
+const CHANNEL_FILES_PAGE_SIZE = 30
+
 /**
  * TTL cho Redis message cache (tính bằng giây)
  * 30s — đủ để giảm DB load khi nhiều user cùng mở channel,
  * ngắn đủ để không stale khi có message mới (đã invalidate khi create/delete).
  */
 const MESSAGE_CACHE_TTL = 30
+
+type ChannelFileJoinRow = {
+  attId: string
+  attMessageId: string
+  attUrl: string
+  attType: string
+  attName: string
+  attSize: number
+  attMimeType: string | null
+  attWidth: number | null
+  attHeight: number | null
+  attDuration: number | null
+  attCreatedAt: Date
+  id: string
+  channelId: string
+  content: string
+  type: string
+  parentId: string | null
+  editedAt: Date | null
+  deletedAt: Date | null
+  createdAt: Date
+  updatedAt: Date
+  userId: string
+  userEmail: string
+  userName: string | null
+  userAvatar: string | null
+  userDisplayName: string | null
+  userIsAway: boolean | null
+  userNamePronunciation: string | null
+  userPhone: string | null
+  userDescription: string | null
+  userTimeZone: string | null
+}
 
 @Injectable()
 export class MessageService {
@@ -149,9 +182,15 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
-        userAvatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-        userDisplayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
@@ -404,9 +443,15 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
-        userAvatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-        userDisplayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
@@ -569,10 +614,8 @@ export class MessageService {
 
     if (!row) throw new NotFoundException('User not found')
 
-    const name =
-      row.wmName ?? row.accountName ?? null
-    const avatar =
-      row.wmAvatar ?? row.accountAvatar ?? null
+    const name = row.wmName ?? row.accountName ?? null
+    const avatar = row.wmAvatar ?? row.accountAvatar ?? null
     const profile = {
       id: row.id,
       name,
@@ -721,5 +764,263 @@ export class MessageService {
         channelId: messageRow.channelId,
       }
     }
+  }
+
+  private parseAttachmentCursor(
+    cursor?: string,
+  ): { at: Date; id: string } | null {
+    if (!cursor?.trim()) return null
+    const sep = cursor.lastIndexOf('__')
+    if (sep <= 0) return null
+    const t = cursor.slice(0, sep)
+    const id = cursor.slice(sep + 2)
+    if (!id) return null
+    const at = new Date(t)
+    if (Number.isNaN(at.getTime())) return null
+    return { at, id }
+  }
+
+  private async mapChannelFileJoinRowsToHits(rows: ChannelFileJoinRow[]) {
+    return Promise.all(
+      rows.map(async (row) => {
+        const rawAtt = {
+          id: row.attId,
+          messageId: row.attMessageId,
+          url: row.attUrl,
+          type: row.attType,
+          name: row.attName,
+          size: row.attSize,
+          mimeType: row.attMimeType,
+          width: row.attWidth,
+          height: row.attHeight,
+          duration: row.attDuration,
+          createdAt: row.attCreatedAt,
+        }
+        const enrichedAtt = await this.enrichAttachmentWithSignedUrl(rawAtt)
+        const attCreated =
+          enrichedAtt.createdAt instanceof Date
+            ? enrichedAtt.createdAt.toISOString()
+            : String(enrichedAtt.createdAt)
+        const attachment = {
+          ...enrichedAtt,
+          createdAt: attCreated,
+        }
+        const message = {
+          id: row.id,
+          channelId: row.channelId,
+          content: row.deletedAt ? '' : row.content,
+          type: row.type,
+          parentId: row.parentId,
+          editedAt: row.editedAt?.toISOString() ?? null,
+          deletedAt: row.deletedAt?.toISOString() ?? null,
+          createdAt: row.createdAt.toISOString(),
+          updatedAt: row.updatedAt.toISOString(),
+          user: {
+            id: row.userId,
+            name: row.userName,
+            avatar: row.userAvatar,
+            email: row.userEmail,
+            displayName: row.userDisplayName,
+            isAway: row.userIsAway,
+            status: null as string | null,
+            namePronunciation: row.userNamePronunciation,
+            phone: row.userPhone,
+            description: row.userDescription,
+            timeZone: row.userTimeZone,
+          },
+          reactions: [] as {
+            emoji: string
+            count: number
+            userIds: string[]
+          }[],
+          attachments: [attachment],
+        }
+        return { attachment, message }
+      }),
+    )
+  }
+
+  /**
+   * Danh sách attachment trong channel (tab Files), cursor ổn định theo thời gian + id.
+   */
+  async listChannelAttachments(
+    channelId: string,
+    userId: string,
+    cursor?: string,
+    limit = CHANNEL_FILES_PAGE_SIZE,
+  ) {
+    await this.assertChannelAccess(channelId, userId)
+
+    const parsed = this.parseAttachmentCursor(cursor)
+    const cursorCond = parsed
+      ? or(
+          lt(attachments.createdAt, parsed.at),
+          and(
+            eq(attachments.createdAt, parsed.at),
+            lt(attachments.id, parsed.id),
+          ),
+        )
+      : undefined
+
+    const whereExpr = cursorCond
+      ? and(
+          eq(messages.channelId, channelId),
+          isNull(messages.deletedAt),
+          cursorCond,
+        )
+      : and(eq(messages.channelId, channelId), isNull(messages.deletedAt))
+
+    const rows = (await this.db
+      .select({
+        attId: attachments.id,
+        attMessageId: attachments.messageId,
+        attUrl: attachments.url,
+        attType: attachments.type,
+        attName: attachments.name,
+        attSize: attachments.size,
+        attMimeType: attachments.mimeType,
+        attWidth: attachments.width,
+        attHeight: attachments.height,
+        attDuration: attachments.duration,
+        attCreatedAt: attachments.createdAt,
+        id: messages.id,
+        channelId: messages.channelId,
+        content: messages.content,
+        type: messages.type,
+        parentId: messages.parentId,
+        editedAt: messages.editedAt,
+        deletedAt: messages.deletedAt,
+        createdAt: messages.createdAt,
+        updatedAt: messages.updatedAt,
+        userId: users.id,
+        userEmail: users.email,
+        userName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userPhone: workspaceMembers.phone,
+        userDescription: workspaceMembers.description,
+        userTimeZone: workspaceMembers.timeZone,
+      })
+      .from(attachments)
+      .innerJoin(messages, eq(attachments.messageId, messages.id))
+      .innerJoin(channels, eq(messages.channelId, channels.id))
+      .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
+      .where(whereExpr)
+      .orderBy(desc(attachments.createdAt), desc(attachments.id))
+      .limit(limit + 1)) as ChannelFileJoinRow[]
+
+    const hasMore = rows.length > limit
+    const pageRows = rows.slice(0, limit)
+    const results = await this.mapChannelFileJoinRowsToHits(pageRows)
+
+    const last = pageRows[pageRows.length - 1]
+    const nextCursor =
+      hasMore && last
+        ? `${last.attCreatedAt.toISOString()}__${last.attId}`
+        : null
+
+    return { results, nextCursor, hasMore }
+  }
+
+  /**
+   * Tìm file đính kèm trong channel theo tên (ILIKE, không phân biệt hoa thường).
+   * Dùng cho tab Files: gợi ý search + lọc sau khi Enter.
+   */
+  async searchChannelFiles(
+    channelId: string,
+    userId: string,
+    q: string,
+    limit = 30,
+  ) {
+    await this.assertChannelAccess(channelId, userId)
+    const term = q.trim()
+    if (!term) {
+      return { results: [] }
+    }
+
+    const escaped = term
+      .replace(/\\/g, '\\\\')
+      .replace(/%/g, '\\%')
+      .replace(/_/g, '\\_')
+    const pattern = `%${escaped}%`
+
+    const rows = (await this.db
+      .select({
+        attId: attachments.id,
+        attMessageId: attachments.messageId,
+        attUrl: attachments.url,
+        attType: attachments.type,
+        attName: attachments.name,
+        attSize: attachments.size,
+        attMimeType: attachments.mimeType,
+        attWidth: attachments.width,
+        attHeight: attachments.height,
+        attDuration: attachments.duration,
+        attCreatedAt: attachments.createdAt,
+        id: messages.id,
+        channelId: messages.channelId,
+        content: messages.content,
+        type: messages.type,
+        parentId: messages.parentId,
+        editedAt: messages.editedAt,
+        deletedAt: messages.deletedAt,
+        createdAt: messages.createdAt,
+        updatedAt: messages.updatedAt,
+        userId: users.id,
+        userEmail: users.email,
+        userName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userPhone: workspaceMembers.phone,
+        userDescription: workspaceMembers.description,
+        userTimeZone: workspaceMembers.timeZone,
+      })
+      .from(attachments)
+      .innerJoin(messages, eq(attachments.messageId, messages.id))
+      .innerJoin(channels, eq(messages.channelId, channels.id))
+      .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
+      .where(
+        and(
+          eq(messages.channelId, channelId),
+          isNull(messages.deletedAt),
+          ilike(attachments.name, pattern),
+        ),
+      )
+      .orderBy(desc(attachments.createdAt), desc(attachments.id))
+      .limit(limit)) as ChannelFileJoinRow[]
+
+    const results = await this.mapChannelFileJoinRowsToHits(rows)
+
+    return { results }
   }
 }

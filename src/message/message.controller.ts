@@ -52,6 +52,44 @@ export class MessageController {
   }
 
   /**
+   * GET /channels/:channelId/attachments?cursor=
+   * Danh sách file trong channel (phân trang), tab Files.
+   */
+  @Get('channels/:channelId/attachments')
+  @SkipThrottle({ message: true })
+  listChannelAttachments(
+    @Param('channelId') channelId: string,
+    @Query('cursor') cursor: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.listChannelAttachments(
+      channelId,
+      userId,
+      cursor,
+    )
+  }
+
+  /**
+   * GET /channels/:channelId/files/search?q=
+   * Tìm attachment theo tên trong channel (tab Files).
+   */
+  @Get('channels/:channelId/files/search')
+  @SkipThrottle({ message: true })
+  searchChannelFiles(
+    @Param('channelId') channelId: string,
+    @Query('q') q: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.searchChannelFiles(
+      channelId,
+      userId,
+      q ?? '',
+    )
+  }
+
+  /**
    * GET /messages/:messageId
    * Fetch một message cụ thể (dùng sau khi attachments được thêm)
    */

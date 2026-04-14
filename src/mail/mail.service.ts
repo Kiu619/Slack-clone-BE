@@ -24,6 +24,14 @@ export class MailService {
     )
   }
 
+  private escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  }
+
   private async send(opts: SendEmailOptions): Promise<void> {
     const { error } = await this.resend.emails.send({
       from: this.from,
@@ -70,10 +78,25 @@ export class MailService {
     inviterName: string,
     workspaceName: string,
     inviteUrl: string,
+    channelName?: string,
   ): Promise<void> {
+    const channelLine =
+      channelName != null && channelName.trim() !== ''
+        ? `<p style="color:#454245; font-size:16px; margin-bottom:12px;">
+            They want you to collaborate in <strong>#${this.escapeHtml(channelName.trim())}</strong> in that workspace.
+          </p>`
+        : ''
+
+    const subInv = inviterName.replace(/\s+/g, ' ').trim()
+    const subWs = workspaceName.replace(/\s+/g, ' ').trim()
+    const subject =
+      channelName != null && channelName.trim() !== ''
+        ? `${subInv} invited you to #${channelName.trim()} (${subWs})`
+        : `${subInv} invited you to join ${subWs} on Slack Clone`
+
     await this.send({
       to: email,
-      subject: `${inviterName} invited you to join ${workspaceName} on Slack Clone`,
+      subject,
       html: `
         <div style="font-family:sans-serif; max-width:520px; margin:0 auto; padding:32px; background:#fff;">
           <div style="text-align:center; margin-bottom:32px;">
@@ -84,14 +107,15 @@ export class MailService {
 
           <h2 style="color:#1d1c1d; font-size:24px; margin-bottom:8px;">You're invited!</h2>
           <p style="color:#454245; font-size:16px; margin-bottom:4px;">
-            <strong>${inviterName}</strong> has invited you to join the
-            <strong>${workspaceName}</strong> workspace on Slack Clone.
+            <strong>${this.escapeHtml(inviterName)}</strong> has invited you to join the
+            <strong>${this.escapeHtml(workspaceName)}</strong> workspace on Slack Clone.
           </p>
+          ${channelLine}
           <p style="color:#616061; font-size:14px; margin-bottom:28px;">
             Click the button below to accept the invitation and get started.
           </p>
 
-          <a href="${inviteUrl}"
+          <a href="${this.escapeHtml(inviteUrl)}"
              style="background:#3b1141; color:white; padding:14px 32px; border-radius:6px;
                     text-decoration:none; display:inline-block; font-weight:600; font-size:16px;">
             Accept Invitation
@@ -102,12 +126,12 @@ export class MailService {
           <p style="color:#888; font-size:13px; margin-bottom:4px;">
             Or copy and paste this link into your browser:
           </p>
-          <a href="${inviteUrl}" style="color:#3b1141; font-size:13px; word-break:break-all;">
-            ${inviteUrl}
+          <a href="${this.escapeHtml(inviteUrl)}" style="color:#3b1141; font-size:13px; word-break:break-all;">
+            ${this.escapeHtml(inviteUrl)}
           </a>
 
           <p style="color:#aaa; font-size:12px; margin-top:24px;">
-            This invitation was sent to ${email}. If you were not expecting this,
+            This invitation was sent to ${this.escapeHtml(email)}. If you were not expecting this,
             you can safely ignore this email.
           </p>
         </div>

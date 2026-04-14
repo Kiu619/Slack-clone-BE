@@ -22,6 +22,10 @@ import {
   UpdateMemberStatusSchema,
   type UpdateMemberStatusDto,
 } from './dto/update-member-status.dto'
+import {
+  InviteEmailsSchema,
+  type InviteEmailsDto,
+} from './dto/invite-emails.dto'
 import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe'
 
 @Controller('workspaces')
@@ -55,6 +59,22 @@ export class WorkspaceController {
   getMembers(@Req() req: Request, @Param('id') id: string) {
     const { id: userId } = req.user as { id: string }
     return this.workspaceService.getMembers(id, userId)
+  }
+
+  @Post(':id/invite-emails')
+  @HttpCode(HttpStatus.OK)
+  inviteEmails(
+    @Req() req: Request,
+    @Param('id') workspaceId: string,
+    @Body(new ZodValidationPipe(InviteEmailsSchema)) dto: InviteEmailsDto,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.workspaceService.sendWorkspaceInvitesByEmail(
+      workspaceId,
+      userId,
+      dto.emails,
+      dto.channelId,
+    )
   }
 
   @Get(':id/members/:userId/status')

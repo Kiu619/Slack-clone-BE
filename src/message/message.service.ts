@@ -138,8 +138,7 @@ export class MessageService {
 
     if (!row) throw new NotFoundException('Channel not found')
     if (!row.wsMemberId) throw new ForbiddenException('Not a workspace member')
-    if (row.isPrivate && !row.chMemberId)
-      throw new ForbiddenException('Not a channel member')
+    if (!row.chMemberId) throw new ForbiddenException('Not a channel member')
 
     return {
       id: row.id,

@@ -13,6 +13,7 @@ import { MailService } from '../mail/mail.service'
 import type { CreateWorkspaceDto } from './dto/create-workspace.dto'
 import type { UpdateMemberStatusDto } from './dto/update-member-status.dto'
 import { UserProfileBroadcastService } from '../user-profile/user-profile-broadcast.service'
+import { ChannelService } from '../channel/channel.service'
 
 @Injectable()
 export class WorkspaceService {
@@ -22,6 +23,7 @@ export class WorkspaceService {
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly mail: MailService,
     private readonly profileBroadcastService: UserProfileBroadcastService,
+    private readonly channelService: ChannelService,
   ) {}
 
   async create(userId: string, dto: CreateWorkspaceDto) {
@@ -60,6 +62,14 @@ export class WorkspaceService {
       role: 'owner',
       name: creator?.name ?? null,
       avatar: creator?.avatar ?? null,
+    })
+
+    const defaultChannelName =
+      this.channelService.channelNameFromWorkspaceSlug(dto.slug)
+    await this.channelService.create(workspace.id, userId, {
+      name: defaultChannelName,
+      type: 'text',
+      isPrivate: false,
     })
 
     // Send invite emails to memberEmails (fire-and-forget, don't block response)
@@ -102,6 +112,107 @@ export class WorkspaceService {
         )
       }
     })
+  }
+
+  /**
+   * Gửi email mời tham gia workspace (link /join/:inviteCode) — Resend.
+   * Bỏ qua email đã là member workspace.
+   */
+  async sendWorkspaceInvitesByEmail(
+    workspaceId: string,
+    requesterId: string,
+    emails: string[],
+    channelId?: string,
+  ) {
+    const [membership] = await this.db
+      .select({ id: workspaceMembers.id })
+      .from(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, requesterId),
+        ),
+      )
+      .limit(1)
+
+    if (!membership) {
+      throw new ForbiddenException('You are not a member of this workspace')
+    }
+
+    const [workspace] = await this.db
+      .select()
+      .from(workspaces)
+      .where(eq(workspaces.id, workspaceId))
+      .limit(1)
+
+    if (!workspace) {
+      throw new NotFoundException('Workspace not found')
+    }
+
+    const [inviter] = await this.db
+      .select({ name: users.name, email: users.email })
+      .from(users)
+      .where(eq(users.id, requesterId))
+      .limit(1)
+
+    const inviterName = inviter?.name ?? inviter?.email ?? 'Someone'
+
+    let inviteChannelName: string | undefined
+    if (channelId) {
+      const ch = await this.channelService.findOne(
+        channelId,
+        workspaceId,
+        requesterId,
+      )
+      inviteChannelName = ch.name
+    }
+
+    const membersWithEmail = await this.db
+      .select({ email: users.email })
+      .from(workspaceMembers)
+      .innerJoin(users, eq(users.id, workspaceMembers.userId))
+      .where(eq(workspaceMembers.workspaceId, workspaceId))
+
+    const memberEmailSet = new Set(
+      membersWithEmail.map((m) => m.email.toLowerCase()),
+    )
+
+    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3045'
+    const inviteUrl = `${frontendUrl}/join/${workspace.inviteCode}`
+
+    const seen = new Set<string>()
+    let sent = 0
+    let skipped = 0
+    const failed: { email: string; message: string }[] = []
+
+    for (const raw of emails) {
+      const trimmed = raw.trim()
+      const lower = trimmed.toLowerCase()
+      if (!lower || seen.has(lower)) continue
+      seen.add(lower)
+
+      if (memberEmailSet.has(lower)) {
+        skipped++
+        continue
+      }
+
+      try {
+        await this.mail.sendWorkspaceInvite(
+          trimmed,
+          inviterName,
+          workspace.name,
+          inviteUrl,
+          inviteChannelName,
+        )
+        sent++
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.logger.warn(`Invite email failed for ${trimmed}: ${msg}`)
+        failed.push({ email: trimmed, message: msg })
+      }
+    }
+
+    return { sent, skipped, failed }
   }
 
   async findAllByUser(userId: string) {
@@ -210,6 +321,11 @@ export class WorkspaceService {
       name: joinUser?.name ?? null,
       avatar: joinUser?.avatar ?? null,
     })
+
+    await this.channelService.ensureMembershipInDefaultChannel(
+      workspace.id,
+      userId,
+    )
 
     return workspace
   }

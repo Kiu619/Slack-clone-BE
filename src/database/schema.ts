@@ -128,6 +128,9 @@ export const channels = pgTable(
     slug: text('slug').notNull(),
     type: channelTypeEnum('type').notNull().default('text'),
     isPrivate: boolean('is_private').notNull().default(false),
+    /** Kênh mặc định workspace (vd. #general) — không đổi tên qua API thường user */
+    isDefaultChannel: boolean('is_default_channel').notNull().default(false),
+    topic: text('topic'),
     description: text('description'),
     createdById: text('created_by_id').references(() => users.id, {
       onDelete: 'set null',
@@ -148,7 +151,7 @@ export const channels = pgTable(
   ],
 )
 
-// Junction table: channel members (for private channels)
+/** Membership trong channel (public + private): người tạo = owner; người được thêm sau = member. */
 export const channelMembers = pgTable(
   'channel_members',
   {
@@ -161,6 +164,9 @@ export const channelMembers = pgTable(
     userId: text('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
+    role: text('role', { enum: ['owner', 'admin', 'member'] })
+      .notNull()
+      .default('member'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
   },
   (table) => [

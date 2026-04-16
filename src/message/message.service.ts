@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common'
-import { and, desc, eq, ilike, inArray, isNull, lt, or, sql } from 'drizzle-orm'
+import { and, desc, eq, ilike, inArray, isNull, lt, or, sql, aliasedTable } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
@@ -37,6 +37,35 @@ const CHANNEL_FILES_PAGE_SIZE = 30
  */
 const MESSAGE_CACHE_TTL = 30
 
+type MessageJoinRow = {
+  id: string
+  channelId: string
+  content: string
+  type: 'text' | 'system'
+  parentId: string | null
+  alsoSendToChannel: boolean
+  replyCount: number
+  replyParticipantIds: string[]
+  lastReplyAt: Date | null
+  editedAt: Date | null
+  deletedAt: Date | null
+  createdAt: Date
+  updatedAt: Date
+  userId: string
+  userEmail: string
+  userName: string | null
+  userAvatar: string | null
+  userDisplayName: string | null
+  userIsAway: boolean | null
+  userStatus: string | null
+  userNamePronunciation: string | null
+  userPhone: string | null
+  userDescription: string | null
+  userTimeZone: string | null
+  parentContent?: string | null
+  parentDeletedAt?: Date | null
+}
+
 type ChannelFileJoinRow = {
   attId: string
   attMessageId: string
@@ -52,8 +81,12 @@ type ChannelFileJoinRow = {
   id: string
   channelId: string
   content: string
-  type: string
+  type: 'text' | 'system'
   parentId: string | null
+  alsoSendToChannel: boolean
+  replyCount: number
+  replyParticipantIds: string[]
+  lastReplyAt: Date | null
   editedAt: Date | null
   deletedAt: Date | null
   createdAt: Date
@@ -164,8 +197,12 @@ export class MessageService {
       ? and(
           eq(messages.channelId, channelId),
           lt(messages.createdAt, new Date(cursor)),
+          or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
         )
-      : eq(messages.channelId, channelId)
+      : and(
+          eq(messages.channelId, channelId),
+          or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
+        )
 
     const rows = (await this.db
       .select({
@@ -175,6 +212,19 @@ export class MessageService {
         content: messages.content,
         type: messages.type,
         parentId: messages.parentId,
+        alsoSendToChannel: messages.alsoSendToChannel,
+        replyCount: messages.replyCount,
+        replyParticipantIds: sql<string[]>`
+          COALESCE(
+            (
+              SELECT array_agg(DISTINCT m2.user_id)
+              FROM ${messages} m2
+              WHERE m2.parent_id = ${messages.id}
+            ),
+            '{}'
+          )
+        `,
+        lastReplyAt: messages.lastReplyAt,
         editedAt: messages.editedAt,
         deletedAt: messages.deletedAt,
         createdAt: messages.createdAt,
@@ -191,10 +241,13 @@ export class MessageService {
           string | null
         >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,
         userTimeZone: workspaceMembers.timeZone,
+        parentContent: sql<string | null>`parents.content`,
+        parentDeletedAt: sql<Date | null>`parents.deleted_at`,
       })
       .from(messages)
       .innerJoin(channels, eq(messages.channelId, channels.id))
@@ -206,36 +259,24 @@ export class MessageService {
           eq(workspaceMembers.userId, messages.userId),
         ),
       )
+      .leftJoin(
+        sql`${messages} AS parents`,
+        eq(messages.parentId, sql`parents.id`),
+      )
       .where(whereConditions)
       .orderBy(desc(messages.createdAt))
-      .limit(PAGE_SIZE + 1)) as Array<{
-      id: string
-      channelId: string
-      content: string
-      type: string
-      parentId: string | null
-      editedAt: Date | null
-      deletedAt: Date | null
-      createdAt: Date
-      updatedAt: Date
-      userId: string
-      userEmail: string
-      userName: string | null
-      userDisplayName: string | null
-      userAvatar: string | null
-      userIsAway: boolean | null
-      userStatus: string | null
-      userNamePronunciation: string | null
-      userPhone: string | null
-      userDescription: string | null
-      userTimeZone: string | null
-    }>
+      .limit(PAGE_SIZE + 1)) as MessageJoinRow[]
 
     const hasMore = rows.length > PAGE_SIZE
     const messageRows = rows.slice(0, PAGE_SIZE)
 
     // Lấy reactions và attachments cho các messages này
     const messageIds = messageRows.map((r) => r.id)
+
+    const parentIds = messageRows
+      .filter((r) => r.parentId && r.alsoSendToChannel)
+      .map((r) => r.parentId)
+    const allRelevantIds = Array.from(new Set([...messageIds, ...(parentIds as string[])]))
 
     // Parallel fetch reactions + attachments
     const [reactionRows, attachmentsMap] = await Promise.all([
@@ -247,12 +288,6 @@ export class MessageService {
               userId: reactions.userId,
             })
             .from(reactions)
-            /**
-             * inArray() từ drizzle-orm → sinh SQL: WHERE message_id IN ($1, $2, $3)
-             * Tương đương ANY nhưng đúng cú pháp — không bị lỗi "requires array on right side"
-             * Không dùng sql`= ANY(${messageIds})` vì postgres.js truyền JS array
-             * dưới dạng tuple thay vì PostgreSQL array type.
-             */
             .where(inArray(reactions.messageId, messageIds)) as Promise<
             Array<{
               messageId: string
@@ -261,7 +296,7 @@ export class MessageService {
             }>
           >)
         : Promise.resolve([]),
-      this.attachmentService.getAttachmentsByMessageIds(messageIds),
+      this.attachmentService.getAttachmentsByMessageIds(allRelevantIds),
     ])
 
     // Group reactions theo messageId
@@ -290,8 +325,12 @@ export class MessageService {
           id: row.id,
           channelId: row.channelId,
           content: row.deletedAt ? '' : row.content,
-          type: row.type,
-          parentId: row.parentId,
+      type: row.type,
+      parentId: row.parentId,
+      alsoSendToChannel: row.alsoSendToChannel,
+      replyCount: row.replyCount,
+      replyParticipantIds: row.replyParticipantIds,
+      lastReplyAt: row.lastReplyAt?.toISOString() ?? null,
           editedAt: row.editedAt?.toISOString() ?? null,
           deletedAt: row.deletedAt?.toISOString() ?? null,
           createdAt: row.createdAt.toISOString(),
@@ -311,6 +350,18 @@ export class MessageService {
           },
           reactions: reactionsByMessage[row.id] ?? [],
           attachments: enrichedAtts,
+          parent:
+            row.parentId && row.alsoSendToChannel
+              ? {
+                  content: row.parentDeletedAt ? '' : row.parentContent ?? '',
+                  deletedAt: row.parentDeletedAt?.toISOString() ?? null,
+                  attachments: await Promise.all(
+                    (attachmentsMap.get(row.parentId) ?? []).map((a) =>
+                      this.enrichAttachmentWithSignedUrl(a),
+                    ),
+                  ),
+                }
+              : undefined,
         }
       }),
     )
@@ -331,6 +382,176 @@ export class MessageService {
     }
 
     return result
+  }
+
+  /**
+   * getThreadMessages — lấy danh sách reply trong một thread
+   * Phân trang theo cursor (createdAt) tương tự getMessages.
+   */
+  async getThreadMessages(parentId: string, userId: string, cursor?: string) {
+    // 1. Lấy tin nhắn cha để biết channelId
+    const [parent] = await this.db
+      .select({ channelId: messages.channelId })
+      .from(messages)
+      .where(eq(messages.id, parentId))
+      .limit(1)
+
+    if (!parent) throw new NotFoundException('Parent message not found')
+
+    // 2. Kiểm tra quyền truy cập channel
+    await this.assertChannelAccess(parent.channelId, userId)
+
+    // 3. Query replies
+    const whereConditions = cursor
+      ? and(
+          eq(messages.parentId, parentId),
+          lt(messages.createdAt, new Date(cursor)),
+        )
+      : eq(messages.parentId, parentId)
+
+    const rows = (await this.db
+      .select({
+        id: messages.id,
+        channelId: messages.channelId,
+        content: messages.content,
+        type: messages.type,
+        parentId: messages.parentId,
+        alsoSendToChannel: messages.alsoSendToChannel,
+        replyCount: messages.replyCount,
+        replyParticipantIds: sql<string[]>`
+          COALESCE(
+            (
+              SELECT array_agg(DISTINCT m2.user_id)
+              FROM ${messages} m2
+              WHERE m2.parent_id = ${messages.id}
+            ),
+            '{}'
+          )
+        `,
+        lastReplyAt: messages.lastReplyAt,
+        editedAt: messages.editedAt,
+        deletedAt: messages.deletedAt,
+        createdAt: messages.createdAt,
+        updatedAt: messages.updatedAt,
+        userId: users.id,
+        userEmail: users.email,
+        userName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        userAvatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        userDisplayName: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userPhone: workspaceMembers.phone,
+        userDescription: workspaceMembers.description,
+        userTimeZone: workspaceMembers.timeZone,
+      })
+      .from(messages)
+      .innerJoin(channels, eq(messages.channelId, channels.id))
+      .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
+      .where(whereConditions)
+      .orderBy(desc(messages.createdAt))
+      .limit(PAGE_SIZE + 1)) as MessageJoinRow[]
+
+    const hasMore = rows.length > PAGE_SIZE
+    const messageRows = rows.slice(0, PAGE_SIZE)
+    const messageIds = messageRows.map((r) => r.id)
+
+    // 4. Fetch reactions + attachments
+    const [reactionRows, attachmentsMap] = await Promise.all([
+      messageIds.length > 0
+        ? (this.db
+            .select({
+              messageId: reactions.messageId,
+              emoji: reactions.emoji,
+              userId: reactions.userId,
+            })
+            .from(reactions)
+            .where(inArray(reactions.messageId, messageIds)) as Promise<
+            Array<{ messageId: string; emoji: string; userId: string }>
+          >)
+        : Promise.resolve([]),
+      this.attachmentService.getAttachmentsByMessageIds(messageIds),
+    ])
+
+    // Group reactions
+    const reactionsByMessage = reactionRows.reduce<
+      Record<string, { emoji: string; count: number; userIds: string[] }[]>
+    >((acc, r) => {
+      if (!acc[r.messageId]) acc[r.messageId] = []
+      const existing = acc[r.messageId].find((x) => x.emoji === r.emoji)
+      if (existing) {
+        existing.count++
+        existing.userIds.push(r.userId)
+      } else {
+        acc[r.messageId].push({
+          emoji: r.emoji,
+          count: 1,
+          userIds: [r.userId],
+        })
+      }
+      return acc
+    }, {})
+
+    // Format response
+    const formattedMessages = await Promise.all(
+      messageRows.map(async (row) => {
+        const atts = attachmentsMap.get(row.id) ?? []
+        const enrichedAtts = await Promise.all(
+          atts.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+        )
+        return {
+          id: row.id,
+          channelId: row.channelId,
+          content: row.deletedAt ? '' : row.content,
+      type: row.type,
+      parentId: row.parentId,
+      alsoSendToChannel: row.alsoSendToChannel,
+      replyCount: row.replyCount,
+      replyParticipantIds: row.replyParticipantIds,
+      lastReplyAt: row.lastReplyAt?.toISOString() ?? null,
+          editedAt: row.editedAt?.toISOString() ?? null,
+          deletedAt: row.deletedAt?.toISOString() ?? null,
+          createdAt: row.createdAt.toISOString(),
+          updatedAt: row.updatedAt.toISOString(),
+          user: {
+            id: row.userId,
+            name: row.userName,
+            avatar: row.userAvatar,
+            email: row.userEmail,
+            displayName: row.userDisplayName,
+            isAway: row.userIsAway,
+            status: null,
+            namePronunciation: row.userNamePronunciation,
+            phone: row.userPhone,
+            description: row.userDescription,
+            timeZone: row.userTimeZone,
+          },
+          reactions: reactionsByMessage[row.id] ?? [],
+          attachments: enrichedAtts,
+        }
+      }),
+    )
+
+    return {
+      messages: formattedMessages,
+      nextCursor: hasMore
+        ? messageRows[messageRows.length - 1].createdAt.toISOString()
+        : null,
+      hasMore,
+    }
   }
 
   /**
@@ -392,22 +613,39 @@ export class MessageService {
         content: dto.content,
         type: 'text',
         parentId: dto.parentId ?? null,
+        alsoSendToChannel: dto.alsoSendToChannel ?? false,
       })
-      .returning()) as Array<{
-      id: string
-      channelId: string
-      userId: string
-      content: string
-      type: string
-      parentId: string | null
-      editedAt: Date | null
-      deletedAt: Date | null
-      createdAt: Date
-      updatedAt: Date
-    }>
+      .returning()) as MessageJoinRow[]
 
     // Invalidate page 1 cache vì có message mới → cache cũ sẽ thiếu message này
     await this.redis.del(this.messageCacheKey(channelId))
+
+    // Nếu là reply trong thread, cập nhật metadata cho tin nhắn cha
+    let parentReplyCount = 0
+    let parentReplyParticipantIds: string[] = []
+    if (dto.parentId) {
+      const [updatedParent] = await this.db
+        .update(messages)
+        .set({
+          replyCount: sql`${messages.replyCount} + 1`,
+          lastReplyAt: new Date(),
+        })
+        .where(eq(messages.id, dto.parentId))
+        .returning({ 
+          replyCount: messages.replyCount,
+        })
+      parentReplyCount = updatedParent?.replyCount ?? 0
+
+      // Lấy danh sách ID của những người đã tham gia thread (tối đa 5 người)
+      const participants = await this.db
+        .select({ userId: messages.userId })
+        .from(messages)
+        .where(eq(messages.parentId, dto.parentId))
+        .groupBy(messages.userId)
+        .limit(5)
+      
+      parentReplyParticipantIds = participants.map(p => p.userId)
+    }
 
     const user = await this.getAuthorProfileForWorkspace(userId, workspaceId)
 
@@ -420,6 +658,8 @@ export class MessageService {
       user,
       reactions: [],
       attachments: [],
+      parentReplyCount, // Trả về để broadcast cập nhật UI
+      parentReplyParticipantIds,
     }
   }
 
@@ -436,6 +676,19 @@ export class MessageService {
         content: messages.content,
         type: messages.type,
         parentId: messages.parentId,
+        alsoSendToChannel: messages.alsoSendToChannel,
+        replyCount: messages.replyCount,
+        replyParticipantIds: sql<string[]>`
+          COALESCE(
+            (
+              SELECT array_agg(DISTINCT m2.user_id)
+              FROM ${messages} m2
+              WHERE m2.parent_id = ${messages.id}
+            ),
+            '{}'
+          )
+        `,
+        lastReplyAt: messages.lastReplyAt,
         editedAt: messages.editedAt,
         deletedAt: messages.deletedAt,
         createdAt: messages.createdAt,
@@ -452,6 +705,7 @@ export class MessageService {
           string | null
         >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,
@@ -468,28 +722,7 @@ export class MessageService {
         ),
       )
       .where(eq(messages.id, messageId))
-      .limit(1)) as Array<{
-      id: string
-      channelId: string
-      content: string
-      type: string
-      parentId: string | null
-      editedAt: Date | null
-      deletedAt: Date | null
-      createdAt: Date
-      updatedAt: Date
-      userId: string
-      userName: string | null
-      userAvatar: string | null
-      userEmail: string
-      userDisplayName: string | null
-      userIsAway: boolean | null
-      userStatus: string | null
-      userNamePronunciation: string | null
-      userPhone: string | null
-      userDescription: string | null
-      userTimeZone: string | null
-    }>
+      .limit(1)) as MessageJoinRow[]
 
     if (!row) {
       throw new NotFoundException('Message not found')
@@ -808,8 +1041,12 @@ export class MessageService {
           id: row.id,
           channelId: row.channelId,
           content: row.deletedAt ? '' : row.content,
-          type: row.type,
-          parentId: row.parentId,
+      type: row.type,
+      parentId: row.parentId,
+      alsoSendToChannel: row.alsoSendToChannel,
+      replyCount: row.replyCount,
+      replyParticipantIds: row.replyParticipantIds,
+      lastReplyAt: row.lastReplyAt?.toISOString() ?? null,
           editedAt: row.editedAt?.toISOString() ?? null,
           deletedAt: row.deletedAt?.toISOString() ?? null,
           createdAt: row.createdAt.toISOString(),
@@ -887,6 +1124,19 @@ export class MessageService {
         content: messages.content,
         type: messages.type,
         parentId: messages.parentId,
+        alsoSendToChannel: messages.alsoSendToChannel,
+        replyCount: messages.replyCount,
+        replyParticipantIds: sql<string[]>`
+          COALESCE(
+            (
+              SELECT array_agg(DISTINCT m2.user_id)
+              FROM ${messages} m2
+              WHERE m2.parent_id = ${messages.id}
+            ),
+            '{}'
+          )
+        `,
+        lastReplyAt: messages.lastReplyAt,
         editedAt: messages.editedAt,
         deletedAt: messages.deletedAt,
         createdAt: messages.createdAt,
@@ -903,6 +1153,7 @@ export class MessageService {
           string | null
         >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,
@@ -976,6 +1227,19 @@ export class MessageService {
         content: messages.content,
         type: messages.type,
         parentId: messages.parentId,
+        alsoSendToChannel: messages.alsoSendToChannel,
+        replyCount: messages.replyCount,
+        replyParticipantIds: sql<string[]>`
+          COALESCE(
+            (
+              SELECT array_agg(DISTINCT m2.user_id)
+              FROM ${messages} m2
+              WHERE m2.parent_id = ${messages.id}
+            ),
+            '{}'
+          )
+        `,
+        lastReplyAt: messages.lastReplyAt,
         editedAt: messages.editedAt,
         deletedAt: messages.deletedAt,
         createdAt: messages.createdAt,
@@ -992,6 +1256,7 @@ export class MessageService {
           string | null
         >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,

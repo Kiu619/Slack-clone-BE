@@ -19,7 +19,7 @@ export class ChatBroadcastService {
    */
   broadcastMessage(
     channelId: string,
-    message: unknown,
+    message: any,
     excludeSocketId?: string,
   ) {
     if (!this.server) return
@@ -31,6 +31,27 @@ export class ChatBroadcastService {
     } else {
       // Gửi từ WebSocket event (ChatGateway) → broadcast tất cả
       this.server.to(room).emit('message', message)
+    }
+
+    // Nếu message là reply trong thread, broadcast tới room của thread đó
+    if (message.parentId) {
+      const threadRoom = `thread:${message.parentId}`
+      if (excludeSocketId) {
+        this.server
+          .to(threadRoom)
+          .except(excludeSocketId)
+          .emit('message', message)
+      } else {
+        this.server.to(threadRoom).emit('message', message)
+      }
+
+      // Gửi event cập nhật metadata cho tin nhắn cha ở channel room
+      this.server.to(room).emit('message:metadata-updated', {
+        messageId: message.parentId,
+        replyCount: (message as any).parentReplyCount,
+        replyParticipantIds: (message as any).parentReplyParticipantIds,
+        lastReplyAt: message.createdAt,
+      })
     }
   }
 

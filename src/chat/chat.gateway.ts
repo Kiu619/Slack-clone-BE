@@ -165,6 +165,32 @@ export class ChatGateway
   }
 
   /**
+   * join-thread — client join vào room của thread
+   * Gọi khi user mở Side Panel của một thread
+   */
+  @SubscribeMessage('join-thread')
+  async handleJoinThread(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { threadId: string },
+  ) {
+    const room = `thread:${data.threadId}`
+    await client.join(room)
+    this.logger.log(`Socket ${client.id} joined thread room ${room}`)
+    return { success: true }
+  }
+
+  /** leave-thread — client rời khỏi room thread */
+  @SubscribeMessage('leave-thread')
+  async handleLeaveThread(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { threadId: string },
+  ) {
+    const room = `thread:${data.threadId}`
+    await client.leave(room)
+    return { success: true }
+  }
+
+  /**
    * message — nhận message mới từ client qua WebSocket
    *
    * MessageService.createMessage luôn lấy user info từ DB

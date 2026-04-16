@@ -199,6 +199,12 @@ export const messages = pgTable(
      * Self-reference (messages.id → messages.id)
      */
     parentId: text('parent_id'),
+    /** alsoSendToChannel: cờ đánh dấu reply này cũng được gửi ra channel chính */
+    alsoSendToChannel: boolean('also_send_to_channel').notNull().default(false),
+    /** replyCount: số lượng phản hồi trong thread */
+    replyCount: integer('reply_count').notNull().default(0),
+    /** lastReplyAt: timestamp của phản hồi cuối cùng */
+    lastReplyAt: timestamp('last_reply_at'),
     /** editedAt: timestamp khi message bị chỉnh sửa lần cuối */
     editedAt: timestamp('edited_at'),
     /** deletedAt: soft delete — không xóa khỏi DB, chỉ ẩn nội dung */

@@ -7,6 +7,8 @@ export const CreateMessageSchema = z.object({
     .max(40000, 'Tin nhắn quá dài (tối đa 40,000 ký tự)'),
   /** parentId: nếu có → reply trong thread */
   parentId: z.string().optional(),
+  /** alsoSendToChannel: nếu true → reply cũng được gửi ra channel chính */
+  alsoSendToChannel: z.boolean().optional(),
 })
 
 export type CreateMessageDto = z.infer<typeof CreateMessageSchema>

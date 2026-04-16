@@ -101,6 +101,21 @@ export class MessageController {
   }
 
   /**
+   * GET /messages/:parentId/replies
+   * Lấy danh sách reply trong một thread.
+   */
+  @Get('messages/:parentId/replies')
+  @SkipThrottle({ message: true })
+  getThreadMessages(
+    @Param('parentId') parentId: string,
+    @Query('cursor') cursor: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.getThreadMessages(parentId, userId, cursor)
+  }
+
+  /**
    * POST /channels/:channelId/messages
    *
    * Header X-Socket-Id: socket.id của client gửi request.

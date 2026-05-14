@@ -9,6 +9,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
   Req,
   UseGuards,
@@ -49,7 +50,11 @@ export class ChannelController {
   ) {
     const { id: userId } = req.user as { id: string }
     const channel = await this.channelService.create(workspaceId, userId, dto)
-    this.broadcastService.broadcastChannelCreated(workspaceId, channel, socketId)
+    this.broadcastService.broadcastChannelCreated(
+      workspaceId,
+      channel,
+      socketId,
+    )
     return channel
   }
 
@@ -57,6 +62,16 @@ export class ChannelController {
   findAll(@Param('workspaceId') workspaceId: string, @Req() req: Request) {
     const { id: userId } = req.user as { id: string }
     return this.channelService.findAllByWorkspace(workspaceId, userId)
+  }
+
+  @Get(':channelId/member-status')
+  getMemberStatus(
+    @Param('workspaceId') workspaceId: string,
+    @Param('channelId') channelId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.channelService.getMemberStatus(channelId, workspaceId, userId)
   }
 
   @Get(':channelId/members')
@@ -109,7 +124,8 @@ export class ChannelController {
     @Param('workspaceId') workspaceId: string,
     @Param('channelId') channelId: string,
     @Req() req: Request,
-    @Body(new ZodValidationPipe(AddChannelMemberSchema)) dto: AddChannelMemberDto,
+    @Body(new ZodValidationPipe(AddChannelMemberSchema))
+    dto: AddChannelMemberDto,
     @Headers('x-socket-id') socketId?: string,
   ) {
     const { id: userId } = req.user as { id: string }
@@ -159,6 +175,40 @@ export class ChannelController {
     return result
   }
 
+  @Put(':channelId/star')
+  @HttpCode(HttpStatus.OK)
+  async starChannel(
+    @Param('workspaceId') workspaceId: string,
+    @Param('channelId') channelId: string,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.channelService.starChannel(
+      channelId,
+      workspaceId,
+      userId,
+      socketId,
+    )
+  }
+
+  @Delete(':channelId/star')
+  @HttpCode(HttpStatus.OK)
+  async unstarChannel(
+    @Param('workspaceId') workspaceId: string,
+    @Param('channelId') channelId: string,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.channelService.unstarChannel(
+      channelId,
+      workspaceId,
+      userId,
+      socketId,
+    )
+  }
+
   @Get(':channelId')
   findOne(
     @Param('workspaceId') workspaceId: string,
@@ -184,7 +234,11 @@ export class ChannelController {
       userId,
       dto,
     )
-    this.broadcastService.broadcastChannelUpdated(workspaceId, channel, socketId)
+    this.broadcastService.broadcastChannelUpdated(
+      workspaceId,
+      channel,
+      socketId,
+    )
     return channel
   }
 

@@ -1,19 +1,19 @@
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-import { PipeTransform, BadRequestException } from '@nestjs/common'
-import { ZodSchema } from 'zod'
+import { PipeTransform, Injectable, ArgumentMetadata, BadRequestException } from '@nestjs/common';
+import type { ZodSchema } from 'zod';
 
+@Injectable()
 export class ZodValidationPipe implements PipeTransform {
   constructor(private schema: ZodSchema) {}
 
-  transform(value: unknown) {
-    const result = this.schema.safeParse(value)
-    if (!result.success) {
-      const issues = result.error.issues ?? (result.error as any).errors ?? []
-      const messages = issues
-        .map((e: { message: string }) => e.message)
-        .join(', ')
-      throw new BadRequestException(messages)
+  transform(value: unknown, metadata: ArgumentMetadata) {
+    try {
+      const parsedValue = this.schema.parse(value);
+      return parsedValue;
+    } catch (error) {
+      throw new BadRequestException('Validation failed', {
+        cause: error,
+        description: error.errors,
+      });
     }
-    return result.data
   }
 }

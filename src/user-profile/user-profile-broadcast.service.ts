@@ -1,9 +1,15 @@
-import { Injectable } from '@nestjs/common'
+import { Injectable, Inject, forwardRef } from '@nestjs/common'
 import { Server } from 'socket.io'
+import { UnifiedBroadcastService, EntityDomain, EntityAction } from '../chat/unified-broadcast.service'
 
 @Injectable()
 export class UserProfileBroadcastService {
   private server: Server | null = null
+
+  constructor(
+    @Inject(forwardRef(() => UnifiedBroadcastService))
+    private readonly unifiedBroadcastService: UnifiedBroadcastService,
+  ) {}
 
   setServer(server: Server) {
     this.server = server
@@ -32,5 +38,15 @@ export class UserProfileBroadcastService {
     } else {
       this.server.to(room).emit('user_profile_updated', data)
     }
+
+    // Sync chuẩn mới
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId },
+      {
+        domain: EntityDomain.USER,
+        action: EntityAction.UPDATE,
+        payload: { id: data.userId, data, workspaceId }
+      }
+    )
   }
 }

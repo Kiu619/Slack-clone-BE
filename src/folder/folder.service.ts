@@ -9,6 +9,8 @@ import { and, desc, eq, isNull, lt, or, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
+  directMessageConversations,
+  conversationMembers,
   attachments,
   channelFolders,
   channelMembers,
@@ -20,6 +22,7 @@ import {
 } from '../database/schema'
 import { S3Service } from '../upload/s3.service'
 import { RedisService } from '../redis/redis.service'
+import { ChatBroadcastService } from '../chat/chat-broadcast.service'
 import type { UploadFileToFolderDto } from './dto/folder.dto'
 
 const FOLDER_ATTACHMENTS_PAGE_SIZE = 30
@@ -55,6 +58,7 @@ type ChannelFileJoinRow = {
   userPhone: string | null
   userDescription: string | null
   userTimeZone: string | null
+  conversationId: string | null
 }
 
 type FolderLinkRow = ChannelFileJoinRow & {
@@ -68,11 +72,20 @@ export class FolderService {
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly s3Service: S3Service,
     private readonly redis: RedisService,
+    private readonly broadcastService: ChatBroadcastService,
   ) {}
 
+  private folderChatRoom(target: {
+    channelId?: string
+    conversationId?: string
+  }): string {
+    if (target.channelId) return `channel:${target.channelId}`
+    return `conversation:${target.conversationId!}`
+  }
+
   /** Đồng bộ với MessageService.messageCacheKey */
-  private messageCacheKey(channelId: string): string {
-    return `messages:v2:${channelId}:page1`
+  private messageCacheKey(targetId: string): string {
+    return `messages:v2:${targetId}:page1`
   }
 
   private async enrichAttachmentWithSignedUrl<
@@ -90,6 +103,33 @@ export class FolderService {
     } catch {
       return att
     }
+  }
+
+  private async assertConversationAccess(
+    conversationId: string,
+    userId: string,
+  ) {
+    const [row] = await this.db
+      .select({
+        id: directMessageConversations.id,
+        workspaceId: directMessageConversations.workspaceId,
+        memberId: conversationMembers.id,
+      })
+      .from(directMessageConversations)
+      .innerJoin(
+        conversationMembers,
+        and(
+          eq(conversationMembers.conversationId, directMessageConversations.id),
+          eq(conversationMembers.userId, userId),
+        ),
+      )
+      .where(eq(directMessageConversations.id, conversationId))
+      .limit(1)
+
+    if (!row)
+      throw new NotFoundException('Conversation not found or access denied')
+
+    return row
   }
 
   private async assertChannelAccess(channelId: string, userId: string) {
@@ -121,9 +161,27 @@ export class FolderService {
 
     if (!row) throw new NotFoundException('Channel not found')
     if (!row.wsMemberId) throw new ForbiddenException('Not a workspace member')
-    if (!row.chMemberId) throw new ForbiddenException('Not a channel member')
+    if (!row.chMemberId && row.isPrivate) throw new ForbiddenException('Not a channel member')
 
     return row
+  }
+
+  private async assertTargetAccess(
+    target: { channelId?: string; conversationId?: string },
+    userId: string,
+  ) {
+    if (target.channelId) {
+      const ch = await this.assertChannelAccess(target.channelId, userId)
+      return { workspaceId: ch.workspaceId }
+    }
+    if (target.conversationId) {
+      const conv = await this.assertConversationAccess(
+        target.conversationId,
+        userId,
+      )
+      return { workspaceId: conv.workspaceId }
+    }
+    throw new NotFoundException('Target not specified')
   }
 
   private parseFolderLinkCursor(
@@ -140,7 +198,7 @@ export class FolderService {
     return { at, id }
   }
 
-  private async mapChannelFileJoinRowsToHits(rows: ChannelFileJoinRow[]) {
+  private async mapFileJoinRowsToHits(rows: ChannelFileJoinRow[]) {
     return Promise.all(
       rows.map(async (row) => {
         const rawAtt = {
@@ -168,6 +226,7 @@ export class FolderService {
         const message = {
           id: row.id,
           channelId: row.channelId,
+          conversationId: row.conversationId,
           content: row.deletedAt ? '' : row.content,
           type: row.type,
           parentId: row.parentId,
@@ -200,36 +259,49 @@ export class FolderService {
     )
   }
 
-  private async assertFolderInChannel(
+  private async assertFolderInTarget(
     folderId: string,
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
   ): Promise<{ id: string; name: string }> {
+    const whereExpr = target.channelId
+      ? and(
+          eq(channelFolders.id, folderId),
+          eq(channelFolders.channelId, target.channelId),
+        )
+      : and(
+          eq(channelFolders.id, folderId),
+          eq(channelFolders.conversationId, target.conversationId!),
+        )
+
     const [f] = await this.db
       .select({ id: channelFolders.id, name: channelFolders.name })
       .from(channelFolders)
-      .where(
-        and(
-          eq(channelFolders.id, folderId),
-          eq(channelFolders.channelId, channelId),
-        ),
-      )
+      .where(whereExpr)
       .limit(1)
     if (!f) throw new NotFoundException('Folder not found')
     return f
   }
 
-  async listFolders(channelId: string, userId: string) {
-    await this.assertChannelAccess(channelId, userId)
+  async listFolders(
+    target: { channelId?: string; conversationId?: string },
+    userId: string,
+  ) {
+    await this.assertTargetAccess(target, userId)
+    const whereExpr = target.channelId
+      ? eq(channelFolders.channelId, target.channelId)
+      : eq(channelFolders.conversationId, target.conversationId!)
+
     const rows = await this.db
       .select({
         id: channelFolders.id,
         channelId: channelFolders.channelId,
+        conversationId: channelFolders.conversationId,
         name: channelFolders.name,
         createdAt: channelFolders.createdAt,
         updatedAt: channelFolders.updatedAt,
       })
       .from(channelFolders)
-      .where(eq(channelFolders.channelId, channelId))
+      .where(whereExpr)
       .orderBy(desc(channelFolders.createdAt))
 
     return {
@@ -241,24 +313,35 @@ export class FolderService {
     }
   }
 
-  async createFolder(channelId: string, userId: string, name: string) {
-    await this.assertChannelAccess(channelId, userId)
+  async createFolder(
+    target: { channelId?: string; conversationId?: string },
+    userId: string,
+    name: string,
+  ) {
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
     const trimmed = name.trim()
     try {
       const [row] = await this.db
         .insert(channelFolders)
         .values({
           id: randomUUID(),
-          channelId,
+          channelId: target.channelId ?? null,
+          conversationId: target.conversationId ?? null,
           name: trimmed,
           createdById: userId,
         })
         .returning()
       if (!row) throw new ConflictException('Could not create folder')
+      void this.broadcastService.broadcastFoldersSync(
+        { channelId: target.channelId, conversationId: target.conversationId },
+        workspaceId,
+        { folderAction: 'created' },
+      )
       return {
         folder: {
           id: row.id,
           channelId: row.channelId,
+          conversationId: row.conversationId,
           name: row.name,
           createdAt: row.createdAt.toISOString(),
           updatedAt: row.updatedAt.toISOString(),
@@ -274,13 +357,13 @@ export class FolderService {
   }
 
   async renameFolder(
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
     folderId: string,
     userId: string,
     name: string,
   ) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
     const trimmed = name.trim()
     try {
       const [row] = await this.db
@@ -289,10 +372,16 @@ export class FolderService {
         .where(eq(channelFolders.id, folderId))
         .returning()
       if (!row) throw new NotFoundException('Folder not found')
+      void this.broadcastService.broadcastFoldersSync(
+        { channelId: target.channelId, conversationId: target.conversationId },
+        workspaceId,
+        { folderAction: 'updated', folderId },
+      )
       return {
         folder: {
           id: row.id,
           channelId: row.channelId,
+          conversationId: row.conversationId,
           name: row.name,
           createdAt: row.createdAt.toISOString(),
           updatedAt: row.updatedAt.toISOString(),
@@ -307,22 +396,31 @@ export class FolderService {
     }
   }
 
-  async deleteFolder(channelId: string, folderId: string, userId: string) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+  async deleteFolder(
+    target: { channelId?: string; conversationId?: string },
+    folderId: string,
+    userId: string,
+  ) {
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
     await this.db.delete(channelFolders).where(eq(channelFolders.id, folderId))
+    void this.broadcastService.broadcastFoldersSync(
+      { channelId: target.channelId, conversationId: target.conversationId },
+      workspaceId,
+      { folderAction: 'deleted', folderId },
+    )
     return { deleted: true, folderId }
   }
 
   async listFolderAttachments(
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
     folderId: string,
     userId: string,
     cursor?: string,
     limit = FOLDER_ATTACHMENTS_PAGE_SIZE,
   ) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
 
     const parsed = this.parseFolderLinkCursor(cursor)
     const cursorCond = parsed
@@ -337,7 +435,9 @@ export class FolderService {
 
     const baseWhere = and(
       eq(folderAttachments.folderId, folderId),
-      eq(messages.channelId, channelId),
+      target.channelId
+        ? eq(messages.channelId, target.channelId)
+        : eq(messages.conversationId, target.conversationId!),
       isNull(messages.deletedAt),
     )
 
@@ -360,6 +460,7 @@ export class FolderService {
         attCreatedAt: attachments.createdAt,
         id: messages.id,
         channelId: messages.channelId,
+        conversationId: messages.conversationId,
         content: messages.content,
         type: messages.type,
         parentId: messages.parentId,
@@ -390,12 +491,11 @@ export class FolderService {
         eq(folderAttachments.attachmentId, attachments.id),
       )
       .innerJoin(messages, eq(attachments.messageId, messages.id))
-      .innerJoin(channels, eq(messages.channelId, channels.id))
       .innerJoin(users, eq(messages.userId, users.id))
       .leftJoin(
         workspaceMembers,
         and(
-          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.workspaceId, workspaceId),
           eq(workspaceMembers.userId, messages.userId),
         ),
       )
@@ -405,10 +505,13 @@ export class FolderService {
 
     const hasMore = rows.length > limit
     const pageRows = rows.slice(0, limit)
-    const fileRows: ChannelFileJoinRow[] = pageRows.map(
-      ({ linkId: _l, linkAddedAt: _a, ...rest }) => rest,
-    )
-    const results = await this.mapChannelFileJoinRowsToHits(fileRows)
+    const fileRows: ChannelFileJoinRow[] = pageRows.map((row) => {
+      const rest = { ...row }
+      delete (rest as Record<string, any>)['linkId']
+      delete (rest as Record<string, any>)['linkAddedAt']
+      return rest
+    })
+    const results = await this.mapFileJoinRowsToHits(fileRows)
 
     const last = pageRows[pageRows.length - 1]
     const nextCursor =
@@ -420,19 +523,20 @@ export class FolderService {
   }
 
   async addAttachmentToFolder(
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
     folderId: string,
     userId: string,
     attachmentId: string,
   ) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
 
     const [attRow] = await this.db
       .select({
         id: attachments.id,
         messageId: attachments.messageId,
         channelId: messages.channelId,
+        conversationId: messages.conversationId,
         deletedAt: messages.deletedAt,
       })
       .from(attachments)
@@ -441,8 +545,14 @@ export class FolderService {
       .limit(1)
 
     if (!attRow) throw new NotFoundException('Attachment not found')
-    if (attRow.channelId !== channelId)
+    if (target.channelId && attRow.channelId !== target.channelId)
       throw new ForbiddenException('Attachment is not in this channel')
+    if (
+      target.conversationId &&
+      attRow.conversationId !== target.conversationId
+    )
+      throw new ForbiddenException('Attachment is not in this conversation')
+
     if (attRow.deletedAt)
       throw new ForbiddenException('Cannot add attachment from deleted message')
 
@@ -461,17 +571,23 @@ export class FolderService {
       throw e
     }
 
+    void this.broadcastService.broadcastFoldersSync(
+      { channelId: target.channelId, conversationId: target.conversationId },
+      workspaceId,
+      { folderAction: 'attachments', folderId },
+    )
+
     return { ok: true, folderId, attachmentId }
   }
 
   async removeAttachmentFromFolder(
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
     folderId: string,
     userId: string,
     attachmentId: string,
   ) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
 
     const res = await this.db
       .delete(folderAttachments)
@@ -485,6 +601,12 @@ export class FolderService {
 
     if (!res.length) throw new NotFoundException('Attachment not in folder')
 
+    void this.broadcastService.broadcastFoldersSync(
+      { channelId: target.channelId, conversationId: target.conversationId },
+      workspaceId,
+      { folderAction: 'attachments', folderId },
+    )
+
     return { ok: true, folderId, attachmentId }
   }
 
@@ -494,21 +616,23 @@ export class FolderService {
    * client ẩn `type === 'system'` khỏi timeline chat.
    */
   async uploadFileToFolder(
-    channelId: string,
+    target: { channelId?: string; conversationId?: string },
     folderId: string,
     userId: string,
     dto: UploadFileToFolderDto,
   ) {
-    await this.assertChannelAccess(channelId, userId)
-    await this.assertFolderInChannel(folderId, channelId)
+    const { workspaceId } = await this.assertTargetAccess(target, userId)
+    await this.assertFolderInTarget(folderId, target)
 
     const { msg, att } = await this.db.transaction(async (tx) => {
       const [m] = (await tx
         .insert(messages)
         .values({
           id: randomUUID(),
-          channelId,
+          channelId: target.channelId ?? null,
+          conversationId: target.conversationId ?? null,
           userId,
+          workspaceId,
           content: '<p></p>',
           /** Không hiển thị trong timeline chat — client lọc `type === 'system'` */
           type: 'system',
@@ -516,11 +640,15 @@ export class FolderService {
         })
         .returning()) as Array<{ id: string }>
 
-      const [a] = (await tx
+      const [a] = await tx
         .insert(attachments)
         .values({
           id: randomUUID(),
           messageId: m.id,
+          userId,
+          workspaceId,
+          channelId: target.channelId ?? null,
+          conversationId: target.conversationId ?? null,
           url: dto.url,
           type: dto.type,
           name: dto.name,
@@ -529,20 +657,9 @@ export class FolderService {
           width: dto.width ?? null,
           height: dto.height ?? null,
           duration: dto.duration ?? null,
+          originScope: 'message_body',
         })
-        .returning()) as Array<{
-        id: string
-        messageId: string
-        url: string
-        type: string
-        name: string
-        size: number
-        mimeType: string | null
-        width: number | null
-        height: number | null
-        duration: number | null
-        createdAt: Date
-      }>
+        .returning()
 
       await tx.insert(folderAttachments).values({
         id: randomUUID(),
@@ -554,7 +671,8 @@ export class FolderService {
       return { msg: m, att: a }
     })
 
-    await this.redis.del(this.messageCacheKey(channelId))
+    const targetId = (target.channelId || target.conversationId) as string
+    await this.redis.del(this.messageCacheKey(targetId))
 
     const enriched = await this.enrichAttachmentWithSignedUrl({
       ...att,
@@ -565,12 +683,28 @@ export class FolderService {
         ? enriched.createdAt.toISOString()
         : String(enriched.createdAt)
 
+    const attachmentPayload = {
+      ...enriched,
+      createdAt,
+    }
+    const room = this.folderChatRoom(target)
+    void this.broadcastService.broadcastAttachmentAdded(
+      room,
+      { messageId: msg.id, attachment: attachmentPayload },
+      undefined,
+      undefined,
+      undefined,
+      workspaceId,
+    )
+    void this.broadcastService.broadcastFoldersSync(
+      { channelId: target.channelId, conversationId: target.conversationId },
+      workspaceId,
+      { folderAction: 'attachments', folderId },
+    )
+
     return {
       messageId: msg.id,
-      attachment: {
-        ...enriched,
-        createdAt,
-      },
+      attachment: attachmentPayload,
     }
   }
 }

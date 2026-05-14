@@ -1,14 +1,14 @@
-import { Module } from '@nestjs/common'
+import { forwardRef, Module } from '@nestjs/common'
 import { UserProfileController } from './user-profile.controller'
 import { UserProfileService } from './user-profile.service'
-import { UserProfileGateway } from './user-profile.gateway'
 import { UserProfileBroadcastService } from './user-profile-broadcast.service'
 import { JwtModule } from '@nestjs/jwt'
+import { ChatModule } from '../chat/chat.module'
 
 @Module({
-  imports: [JwtModule],
+  imports: [JwtModule, forwardRef(() => ChatModule)],
   controllers: [UserProfileController],
-  providers: [UserProfileService, UserProfileGateway, UserProfileBroadcastService],
+  providers: [UserProfileService, UserProfileBroadcastService],
   exports: [UserProfileService, UserProfileBroadcastService],
 })
 export class UserProfileModule {}

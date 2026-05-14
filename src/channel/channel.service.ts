@@ -8,6 +8,9 @@ import {
 import { and, asc, eq, ilike, isNull, ne, or, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
+import { MessageService } from '../message/message.service'
+import { ChatBroadcastService } from '../chat/chat-broadcast.service'
+import { UnifiedBroadcastService } from '../chat/unified-broadcast.service'
 import {
   channels,
   channelMembers,
@@ -19,7 +22,12 @@ import type { UpdateChannelDto } from './dto/update-channel.dto'
 
 @Injectable()
 export class ChannelService {
-  constructor(@Inject(DRIZZLE) private readonly db: DrizzleDB) {}
+  constructor(
+    @Inject(DRIZZLE) private readonly db: DrizzleDB,
+    private readonly messageService: MessageService,
+    private readonly chatBroadcastService: ChatBroadcastService,
+    private readonly unifiedBroadcastService: UnifiedBroadcastService,
+  ) {}
 
   private slugify(name: string): string {
     return name
@@ -59,11 +67,7 @@ export class ChannelService {
     return member
   }
 
-  async create(
-    workspaceId: string,
-    userId: string,
-    dto: CreateChannelDto,
-  ) {
+  async create(workspaceId: string, userId: string, dto: CreateChannelDto) {
     await this.assertMembership(workspaceId, userId)
 
     const slug = this.slugify(dto.name)
@@ -112,7 +116,7 @@ export class ChannelService {
       role: 'owner',
     })
 
-    return channel
+    return { ...channel, starredAt: null as Date | null }
   }
 
   async update(
@@ -169,20 +173,55 @@ export class ChannelService {
       return channel
     }
 
+    const keepStarredAt = channel.starredAt ?? null
+
     const [updated] = await this.db
       .update(channels)
       .set(patch)
       .where(eq(channels.id, channelId))
       .returning()
 
-    return updated ?? channel
+    const result = updated ?? channel
+    const norm = (v: string | null | undefined) =>
+      v == null || String(v).trim() === '' ? null : String(v).trim()
+
+    const topicChanged =
+      dto.topic !== undefined && norm(channel.topic) !== norm(result.topic)
+    const descriptionChanged =
+      dto.description !== undefined &&
+      norm(channel.description) !== norm(result.description)
+
+    const room = `channel:${channelId}`
+    if (topicChanged) {
+      const m = await this.messageService.createTimelineTextMessage(
+        { channelId },
+        userId,
+        'channel_topic',
+        result.topic ?? null,
+      )
+      this.chatBroadcastService.broadcastMessage(room, m, undefined)
+    }
+    if (descriptionChanged) {
+      const m = await this.messageService.createTimelineTextMessage(
+        { channelId },
+        userId,
+        'channel_description',
+        result.description ?? null,
+      )
+      this.chatBroadcastService.broadcastMessage(room, m, undefined)
+    }
+
+    return { ...result, starredAt: keepStarredAt }
   }
 
   async findAllByWorkspace(workspaceId: string, userId: string) {
     await this.assertMembership(workspaceId, userId)
 
     const rows = await this.db
-      .select({ channel: channels })
+      .select({
+        channel: channels,
+        starredAt: channelMembers.starredAt,
+      })
       .from(channelMembers)
       .innerJoin(channels, eq(channelMembers.channelId, channels.id))
       .where(
@@ -192,7 +231,12 @@ export class ChannelService {
         ),
       )
 
-    return rows.map((r) => r.channel).sort((a, b) => a.name.localeCompare(b.name))
+    return rows
+      .map((r) => ({
+        ...r.channel,
+        starredAt: r.starredAt ?? null,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name))
   }
 
   async findOne(channelId: string, workspaceId: string, userId: string) {
@@ -202,10 +246,7 @@ export class ChannelService {
       .select()
       .from(channels)
       .where(
-        and(
-          eq(channels.id, channelId),
-          eq(channels.workspaceId, workspaceId),
-        ),
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
       )
       .limit(1)
 
@@ -214,7 +255,7 @@ export class ChannelService {
     }
 
     const [membership] = await this.db
-      .select({ id: channelMembers.id })
+      .select({ id: channelMembers.id, starredAt: channelMembers.starredAt })
       .from(channelMembers)
       .where(
         and(
@@ -224,11 +265,16 @@ export class ChannelService {
       )
       .limit(1)
 
-    if (!membership) {
-      throw new ForbiddenException('You are not a member of this channel')
+    if (!membership && channel.isPrivate) {
+      throw new ForbiddenException(
+        'You are not a member of this private channel',
+      )
     }
 
-    return channel
+    return {
+      ...channel,
+      starredAt: membership?.starredAt ?? null,
+    }
   }
 
   /**
@@ -283,10 +329,7 @@ export class ChannelService {
       .select({ id: channels.id, isDefaultChannel: channels.isDefaultChannel })
       .from(channels)
       .where(
-        and(
-          eq(channels.id, channelId),
-          eq(channels.workspaceId, workspaceId),
-        ),
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
       )
       .limit(1)
 
@@ -307,7 +350,10 @@ export class ChannelService {
   private ilikeSearchPattern(raw: string): string {
     const t = raw.trim()
     if (!t) return '%'
-    const escaped = t.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+    const escaped = t
+      .replace(/\\/g, '\\\\')
+      .replace(/%/g, '\\%')
+      .replace(/_/g, '\\_')
     return `%${escaped}%`
   }
 
@@ -323,17 +369,55 @@ export class ChannelService {
     )
   }
 
-  private memberSelectFields(joinedAtCol: typeof channelMembers.joinedAt | typeof workspaceMembers.joinedAt) {
+  private memberSelectFields(
+    joinedAtCol:
+      | typeof channelMembers.joinedAt
+      | typeof workspaceMembers.joinedAt,
+  ) {
     return {
       id: users.id,
-      name: sql<string | null>`COALESCE(${workspaceMembers.name}, ${users.name})`,
-      displayName: sql<string | null>`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+      name: sql<
+        string | null
+      >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+      displayName: sql<
+        string | null
+      >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
       email: users.email,
-      avatar: sql<string | null>`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+      avatar: sql<
+        string | null
+      >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
       isAway: workspaceMembers.isAway,
       statusEmoji: workspaceMembers.statusEmoji,
       statusText: workspaceMembers.statusText,
       joinedAt: joinedAtCol,
+    }
+  }
+
+  async getMemberStatus(
+    channelId: string,
+    workspaceId: string,
+    userId: string,
+  ) {
+    await this.assertMembership(workspaceId, userId)
+    const [viewerMembership] = await this.db
+      .select({ id: channelMembers.id })
+      .from(channelMembers)
+      .where(
+        and(
+          eq(channelMembers.channelId, channelId),
+          eq(channelMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    if (!viewerMembership) {
+      return {
+        isMember: false,
+      }
+    }
+
+    return {
+      isMember: true,
     }
   }
 
@@ -350,13 +434,10 @@ export class ChannelService {
     await this.assertMembership(workspaceId, userId)
 
     const [channel] = await this.db
-      .select({ id: channels.id })
+      .select({ id: channels.id, isPrivate: channels.isPrivate })
       .from(channels)
       .where(
-        and(
-          eq(channels.id, channelId),
-          eq(channels.workspaceId, workspaceId),
-        ),
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
       )
       .limit(1)
 
@@ -373,7 +454,7 @@ export class ChannelService {
       )
       .limit(1)
 
-    if (!viewerMembership) {
+    if (!viewerMembership && channel.isPrivate) {
       throw new ForbiddenException('You are not a member of this channel')
     }
 
@@ -486,10 +567,7 @@ export class ChannelService {
       .select({ isDefaultChannel: channels.isDefaultChannel })
       .from(channels)
       .where(
-        and(
-          eq(channels.id, channelId),
-          eq(channels.workspaceId, workspaceId),
-        ),
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
       )
       .limit(1)
 
@@ -546,16 +624,15 @@ export class ChannelService {
       })
       .from(channels)
       .where(
-        and(
-          eq(channels.id, channelId),
-          eq(channels.workspaceId, workspaceId),
-        ),
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
       )
       .limit(1)
 
     if (!ch) throw new NotFoundException('Channel not found')
     if (ch.isDefaultChannel) {
-      throw new ForbiddenException('Cannot remove members from the default channel')
+      throw new ForbiddenException(
+        'Cannot remove members from the default channel',
+      )
     }
 
     await this.findOne(channelId, workspaceId, requesterId)
@@ -583,5 +660,136 @@ export class ChannelService {
     }
 
     return { ok: true as const }
+  }
+
+  private toStarredAtIso(
+    v: Date | string | null | undefined,
+  ): string | null {
+    if (v == null) return null
+    if (v instanceof Date) return v.toISOString()
+    if (typeof v === 'string') return v
+    return null
+  }
+
+  private broadcastSidebarStarChannel(
+    userId: string,
+    workspaceId: string,
+    channelId: string,
+    starredAt: Date | string | null | undefined,
+    excludeSocketId?: string,
+  ) {
+    this.unifiedBroadcastService.broadcastToUser(
+      userId,
+      workspaceId,
+      'sidebar:star',
+      {
+        kind: 'channel' as const,
+        id: channelId,
+        starredAt: this.toStarredAtIso(starredAt),
+      },
+      excludeSocketId,
+    )
+  }
+
+  async starChannel(
+    channelId: string,
+    workspaceId: string,
+    userId: string,
+    excludeSocketId?: string,
+  ) {
+    await this.assertMembership(workspaceId, userId)
+
+    const [ch] = await this.db
+      .select({ id: channels.id })
+      .from(channels)
+      .where(
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
+      )
+      .limit(1)
+
+    if (!ch) {
+      throw new NotFoundException('Channel not found')
+    }
+
+    const [mem] = await this.db
+      .select({ id: channelMembers.id })
+      .from(channelMembers)
+      .where(
+        and(
+          eq(channelMembers.channelId, channelId),
+          eq(channelMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    if (!mem) {
+      throw new ForbiddenException(
+        'You must be a member of this channel to star it',
+      )
+    }
+
+    await this.db
+      .update(channelMembers)
+      .set({ starredAt: new Date() })
+      .where(eq(channelMembers.id, mem.id))
+
+    const updated = await this.findOne(channelId, workspaceId, userId)
+    this.broadcastSidebarStarChannel(
+      userId,
+      workspaceId,
+      channelId,
+      updated.starredAt,
+      excludeSocketId,
+    )
+    return updated
+  }
+
+  async unstarChannel(
+    channelId: string,
+    workspaceId: string,
+    userId: string,
+    excludeSocketId?: string,
+  ) {
+    await this.assertMembership(workspaceId, userId)
+
+    const [ch] = await this.db
+      .select({ id: channels.id })
+      .from(channels)
+      .where(
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
+      )
+      .limit(1)
+
+    if (!ch) {
+      throw new NotFoundException('Channel not found')
+    }
+
+    const [mem] = await this.db
+      .select({ id: channelMembers.id })
+      .from(channelMembers)
+      .where(
+        and(
+          eq(channelMembers.channelId, channelId),
+          eq(channelMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    if (mem) {
+      await this.db
+        .update(channelMembers)
+        .set({ starredAt: null })
+        .where(eq(channelMembers.id, mem.id))
+    }
+
+    const updated = await this.findOne(channelId, workspaceId, userId)
+    this.broadcastSidebarStarChannel(
+      userId,
+      workspaceId,
+      channelId,
+      updated.starredAt,
+      excludeSocketId,
+    )
+    return updated
   }
 }

@@ -1,16 +1,17 @@
 import { randomUUID } from 'crypto'
+import { relations } from 'drizzle-orm'
 import {
+  boolean,
+  doublePrecision,
+  index,
+  integer,
+  jsonb,
+  pgEnum,
   pgTable,
   text,
   timestamp,
   uniqueIndex,
-  index,
-  boolean,
-  integer,
-  doublePrecision,
-  pgEnum,
 } from 'drizzle-orm/pg-core'
-import { relations } from 'drizzle-orm'
 
 export const channelTypeEnum = pgEnum('channel_type', [
   'text',
@@ -94,6 +95,7 @@ export const workspaceMembers = pgTable(
       .default('member'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
     /** Profile trong workspace (Slack-style) */
+    email: text('email'), // Lưu email để hiển thị profile nhanh hơn không cần join users
     name: text('name'),
     displayName: text('display_name'),
     avatar: text('avatar'),
@@ -107,6 +109,24 @@ export const workspaceMembers = pgTable(
     statusExpiration: timestamp('status_expiration'),
     notificationsPausedUntil: timestamp('notifications_paused_until'),
     theme: text('theme'),
+
+    // ─── Global notification preferences ───
+    notifyFor: text('notify_for', {
+      enum: ['all_messages', 'mentions_and_dm', 'nothing'],
+    })
+      .notNull()
+      .default('mentions_and_dm'),
+    notifyOnHereMention: boolean('notify_on_here_mention').notNull().default(true),
+    notifyOnChannelMention: boolean('notify_on_channel_mention')
+      .notNull()
+      .default(true),
+
+    // ─── Do Not Disturb ───
+    dndEnabled: boolean('dnd_enabled').notNull().default(false),
+    /** 0-23, ví dụ: 22 = 10pm */
+    dndStartHour: integer('dnd_start_hour'),
+    dndEndHour: integer('dnd_end_hour'),
+    dndTimezone: text('dnd_timezone'),
   },
   (table) => [
     uniqueIndex('workspace_members_unique').on(table.workspaceId, table.userId),
@@ -168,6 +188,9 @@ export const channelMembers = pgTable(
       .notNull()
       .default('member'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
+    lastReadAt: timestamp('last_read_at').defaultNow().notNull(),
+    /** Star cá nhân (sidebar); null = chưa star */
+    starredAt: timestamp('starred_at'),
   },
   (table) => [
     uniqueIndex('channel_members_unique').on(table.channelId, table.userId),
@@ -176,9 +199,111 @@ export const channelMembers = pgTable(
   ],
 )
 
+// ─── Direct messages ─────────────────────────────────────────────────────────────────
+export const directMessageConversations = pgTable(
+  'dm_conversations',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    /** Phân biệt DM 1-1 và Group DM (max 9 người) */
+    isGroup: boolean('is_group').notNull().default(false),
+    lastMessageAt: timestamp('last_message_at'),
+    lastMessageContent: text('last_message_content'),
+    lastMessageUserId: text('last_message_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    lastMessageId: text('last_message_id').references(() => messages.id, {
+      onDelete: 'set null',
+    }),
+    topic: text('topic'),
+    description: text('description'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [index('dm_conversations_workspace_idx').on(table.workspaceId)],
+)
+
+/** Thành viên trong cuộc hội thoại DM */
+export const conversationMembers = pgTable(
+  'conversation_members',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    conversationId: text('conversation_id')
+      .notNull()
+      .references(() => directMessageConversations.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    joinedAt: timestamp('joined_at').defaultNow().notNull(),
+    lastReadAt: timestamp('last_read_at').defaultNow().notNull(),
+    /** Star cá nhân (sidebar); null = chưa star */
+    starredAt: timestamp('starred_at'),
+  },
+  (table) => [
+    uniqueIndex('conversation_members_unique').on(
+      table.conversationId,
+      table.userId,
+    ),
+    index('conversation_members_conversation_idx').on(table.conversationId),
+    index('conversation_members_user_idx').on(table.userId),
+  ],
+)
+
+/** Channel/DM gần đây trong sidebar toolbar (tối đa 10 / user / workspace) */
+export const workspaceSidebarRecents = pgTable(
+  'workspace_sidebar_recents',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    kind: text('kind', { enum: ['channel', 'dm'] }).notNull(),
+    targetId: text('target_id').notNull(),
+    visitedAt: timestamp('visited_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('workspace_sidebar_recents_user_ws_kind_target').on(
+      table.userId,
+      table.workspaceId,
+      table.kind,
+      table.targetId,
+    ),
+    index('workspace_sidebar_recents_user_ws_visited_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.visitedAt,
+    ),
+  ],
+)
+
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
-export const messageTypeEnum = pgEnum('message_type', ['text', 'system'])
+export const messageTypeEnum = pgEnum('message_type', [
+  'text',
+  'system',
+  'timeline',
+])
+
+export const savedItemStatusEnum = pgEnum('saved_item_status', [
+  'in_progress',
+  'completed',
+  'archived',
+])
+
 
 export const messages = pgTable(
   'messages',
@@ -186,29 +311,35 @@ export const messages = pgTable(
     id: text('id')
       .primaryKey()
       .$defaultFn(() => randomUUID()),
-    channelId: text('channel_id')
-      .notNull()
-      .references(() => channels.id, { onDelete: 'cascade' }),
+
+    // Nullable — chỉ một trong hai được set
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'cascade',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'cascade' },
+    ),
+
     userId: text('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     content: text('content').notNull(),
     type: messageTypeEnum('type').notNull().default('text'),
-    /**
-     * parentId: nếu không null → đây là reply trong thread
-     * Self-reference (messages.id → messages.id)
-     */
     parentId: text('parent_id'),
-    /** alsoSendToChannel: cờ đánh dấu reply này cũng được gửi ra channel chính */
     alsoSendToChannel: boolean('also_send_to_channel').notNull().default(false),
-    /** replyCount: số lượng phản hồi trong thread */
     replyCount: integer('reply_count').notNull().default(0),
-    /** lastReplyAt: timestamp của phản hồi cuối cùng */
     lastReplyAt: timestamp('last_reply_at'),
-    /** editedAt: timestamp khi message bị chỉnh sửa lần cuối */
+    workspaceId: text('workspace_id').references(() => workspaces.id, {
+      onDelete: 'cascade',
+    }),
     editedAt: timestamp('edited_at'),
-    /** deletedAt: soft delete — không xóa khỏi DB, chỉ ẩn nội dung */
     deletedAt: timestamp('deleted_at'),
+    isPinned: boolean('is_pinned').notNull().default(false),
+    /** false = tin do server tạo (topic/description/merge), không cho PATCH nội dung */
+    allowEdit: boolean('allow_edit').notNull().default(true),
+    /** Snapshot tin gốc khi message là forward (JSON) */
+    forwardSnapshot: jsonb('forward_snapshot').$type<Record<string, unknown> | null>(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
@@ -217,10 +348,51 @@ export const messages = pgTable(
   },
   (table) => [
     index('messages_channel_idx').on(table.channelId),
+    index('messages_conversation_idx').on(table.conversationId),
     index('messages_user_idx').on(table.userId),
     index('messages_parent_idx').on(table.parentId),
-    // Index cho cursor pagination: channelId + createdAt DESC
     index('messages_channel_created_idx').on(table.channelId, table.createdAt),
+    index('messages_conversation_created_idx').on(
+      table.conversationId,
+      table.createdAt,
+    ),
+    index('messages_workspace_idx').on(table.workspaceId),
+  ],
+)
+
+export const threadSubscriptions = pgTable(
+  'thread_subscriptions',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    parentMessageId: text('parent_message_id')
+      .notNull()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    lastReadAt: timestamp('last_read_at').defaultNow().notNull(),
+    isMuted: boolean('is_muted').notNull().default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('thread_subscriptions_user_parent_unique').on(
+      table.userId,
+      table.parentMessageId,
+    ),
+    index('thread_subscriptions_user_workspace_idx').on(
+      table.userId,
+      table.workspaceId,
+    ),
+    index('thread_subscriptions_parent_idx').on(table.parentMessageId),
   ],
 )
 
@@ -245,7 +417,11 @@ export const reactions = pgTable(
   },
   (table) => [
     // Mỗi user chỉ react 1 lần với mỗi emoji trên 1 message
-    uniqueIndex('reactions_unique').on(table.messageId, table.userId, table.emoji),
+    uniqueIndex('reactions_unique').on(
+      table.messageId,
+      table.userId,
+      table.emoji,
+    ),
     index('reactions_message_idx').on(table.messageId),
     index('reactions_user_idx').on(table.userId),
   ],
@@ -260,6 +436,28 @@ export const attachments = pgTable(
     messageId: text('message_id')
       .notNull()
       .references(() => messages.id, { onDelete: 'cascade' }),
+
+    // --- Các trường bổ sung cho All Files Search ---
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'set null',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'set null' },
+    ),
+    /**
+     * Phân loại file để filter nhanh:
+     * 'image' | 'video' | 'audio' | 'pdf' | 'spreadsheet' | 'presentation' | 'document' | 'archive' | 'code' | 'other'
+     */
+    fileCategory: text('file_category').notNull().default('other'),
+    // ----------------------------------------------
+
     url: text('url').notNull(),
     /** 'image' | 'video' | 'audio' | 'file' */
     type: text('type').notNull().default('file'),
@@ -274,21 +472,75 @@ export const attachments = pgTable(
     height: integer('height'),
     /** Duration (giây) cho video/audio — dùng double vì Cloudinary trả về số thập phân */
     duration: doublePrecision('duration'),
+    /**
+     * `message_body` — file user gửi / thêm khi sửa tin;
+     * `forward_quote` — bản copy từ tin được forward (dùng khi mixed forward chỉ mang body).
+     */
+    originScope: text('origin_scope').notNull().default('message_body'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
   },
-  (table) => [index('attachments_message_idx').on(table.messageId)],
+  (table) => [
+    index('attachments_message_idx').on(table.messageId),
+    index('attachments_workspace_category_idx').on(
+      table.workspaceId,
+      table.fileCategory,
+    ),
+    index('attachments_user_idx').on(table.userId),
+    index('attachments_channel_idx').on(table.channelId),
+    index('attachments_conversation_idx').on(table.conversationId),
+    index('attachments_created_at_idx').on(table.createdAt),
+  ],
 )
 
-/** Folder trong channel (tab Folders) — tên unique trong channel */
+/** Lịch sử xem file của User (cho tính năng Recently Viewed) */
+export const userFileInteractions = pgTable(
+  'user_file_interactions',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    attachmentId: text('attachment_id')
+      .notNull()
+      .references(() => attachments.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    lastViewedAt: timestamp('last_viewed_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('user_file_interaction_unique').on(
+      table.userId,
+      table.attachmentId,
+    ),
+    index('user_file_interaction_user_workspace_idx').on(
+      table.userId,
+      table.workspaceId,
+    ),
+    index('user_file_interaction_last_viewed_idx').on(table.lastViewedAt),
+  ],
+)
+
+/** Folder trong channel hoặc DM conversation (tab Folders) — tên unique trong phạm vi channel/DM */
 export const channelFolders = pgTable(
   'channel_folders',
   {
     id: text('id')
       .primaryKey()
       .$defaultFn(() => randomUUID()),
-    channelId: text('channel_id')
-      .notNull()
-      .references(() => channels.id, { onDelete: 'cascade' }),
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'cascade',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'cascade' },
+    ),
     name: text('name').notNull(),
     createdById: text('created_by_id').references(() => users.id, {
       onDelete: 'set null',
@@ -304,7 +556,12 @@ export const channelFolders = pgTable(
       table.channelId,
       table.name,
     ),
+    uniqueIndex('channel_folders_conversation_name_unique').on(
+      table.conversationId,
+      table.name,
+    ),
     index('channel_folders_channel_idx').on(table.channelId),
+    index('channel_folders_conversation_idx').on(table.conversationId),
   ],
 )
 
@@ -336,11 +593,304 @@ export const folderAttachments = pgTable(
   ],
 )
 
+/** Draft composer (HTML) đồng bộ đa thiết bị — `context_key` trùng quy ước FE */
+export const messageDrafts = pgTable(
+  'message_drafts',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    contextKey: text('context_key').notNull(),
+    content: text('content').notNull().default(''),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('message_drafts_user_context_key_unique').on(
+      table.userId,
+      table.contextKey,
+    ),
+    index('message_drafts_user_workspace_idx').on(
+      table.userId,
+      table.workspaceId,
+    ),
+  ],
+)
+
+export const messageDraftsRelations = relations(messageDrafts, ({ one }) => ({
+  user: one(users, {
+    fields: [messageDrafts.userId],
+    references: [users.id],
+  }),
+  workspace: one(workspaces, {
+    fields: [messageDrafts.workspaceId],
+    references: [workspaces.id],
+  }),
+}))
+
+export const scheduledMessageStatusEnum = pgEnum('scheduled_message_status', [
+  'pending',
+  'sent',
+  'cancelled',
+])
+
+/** Tin nhắn lên lịch gửi — BullMQ dispatch tại `scheduled_at` */
+export const scheduledMessages = pgTable(
+  'scheduled_messages',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'cascade',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'cascade' },
+    ),
+    parentId: text('parent_id').references(() => messages.id, {
+      onDelete: 'set null',
+    }),
+    content: text('content').notNull(),
+    alsoSendToChannel: boolean('also_send_to_channel').notNull().default(false),
+    scheduledAt: timestamp('scheduled_at', { withTimezone: true }).notNull(),
+    status: scheduledMessageStatusEnum('status').notNull().default('pending'),
+    sentMessageId: text('sent_message_id').references(() => messages.id, {
+      onDelete: 'set null',
+    }),
+    sentAt: timestamp('sent_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    index('scheduled_messages_user_workspace_idx').on(
+      table.userId,
+      table.workspaceId,
+    ),
+    index('scheduled_messages_status_scheduled_at_idx').on(
+      table.status,
+      table.scheduledAt,
+    ),
+  ],
+)
+
+export const savedItems = pgTable(
+  'saved_items',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+
+    /** Loại item: lưu tin nhắn hay lưu file cụ thể */
+    type: text('type', { enum: ['message', 'attachment', 'reminder'] }).notNull(),
+
+    // Một trong hai cái này sẽ có giá trị (hoặc không có nếu là reminder)
+    messageId: text('message_id').references(() => messages.id, {
+      onDelete: 'cascade',
+    }),
+    attachmentId: text('attachment_id').references(() => attachments.id, {
+      onDelete: 'cascade',
+    }),
+
+    /** Ghi chú cá nhân của user cho mục này */
+    note: text('note'),
+    /** Thời điểm nhắc nhở */
+    remindAt: timestamp('remind_at'),
+    status: savedItemStatusEnum('status').notNull().default('in_progress'),
+    completedAt: timestamp('completed_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    index('saved_items_user_message_idx').on(table.userId, table.messageId),
+    index('saved_items_user_attachment_idx').on(table.userId, table.attachmentId),
+    index('saved_items_user_workspace_status_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.status,
+    ),
+    index('saved_items_later_check_message_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.status,
+      table.type,
+      table.messageId,
+    ),
+    index('saved_items_later_check_attachment_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.status,
+      table.type,
+      table.attachmentId,
+    ),
+  ],
+)
+
+// ─── Channel / DM notification overrides ──────────────────────────────────────
+
+export const channelNotificationOverrides = pgTable(
+  'channel_notification_overrides',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+
+    // Một trong hai — cover cả channel lẫn DM trong cùng một bảng
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'cascade',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'cascade' },
+    ),
+
+    muteChannel: boolean('mute_channel').notNull().default(false),
+    /** null = kế thừa từ workspace_members.notifyFor */
+    notifyFor: text('notify_for', {
+      enum: ['all_messages', 'mentions_and_dm', 'nothing'],
+    }),
+    /** Mute tạm thời đến thời điểm này */
+    mutedUntil: timestamp('muted_until'),
+  },
+  (table) => [
+    uniqueIndex('channel_notif_override_channel_unique').on(
+      table.userId,
+      table.channelId,
+    ),
+    uniqueIndex('channel_notif_override_conv_unique').on(
+      table.userId,
+      table.conversationId,
+    ),
+    index('channel_notif_override_user_idx').on(table.userId),
+  ],
+)
+
+// ─── Mentions ─────────────────────────────────────────────────────────────────
+
+export const mentions = pgTable(
+  'mentions',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    messageId: text('message_id')
+      .notNull()
+      .references(() => messages.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+
+    /** null khi type = 'here' | 'channel' | 'everyone' */
+    mentionedUserId: text('mentioned_user_id').references(() => users.id, {
+      onDelete: 'cascade',
+    }),
+
+    /** Lưu dạng <@userId>, <!here>, <!channel> trong message.content */
+    type: text('type', {
+      enum: ['user', 'here', 'channel'],
+    }).notNull(),
+
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('mentions_mentioned_user_idx').on(table.mentionedUserId),
+    index('mentions_message_idx').on(table.messageId),
+    index('mentions_workspace_idx').on(table.workspaceId),
+  ],
+)
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+
+export const notificationTypeEnum = pgEnum('notification_type', [
+  'mention', // @mention trực tiếp
+  'reply', // reply vào thread đang subscribe
+  'dm', // DM mới
+  'reaction', // react vào message của mình
+  'channel_invite', // được thêm vào channel
+])
+
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+
+    type: notificationTypeEnum('type').notNull(),
+
+    /** Đủ context để render notification item mà không cần nhiều join */
+    messageId: text('message_id').references(() => messages.id, {
+      onDelete: 'cascade',
+    }),
+    channelId: text('channel_id').references(() => channels.id, {
+      onDelete: 'set null',
+    }),
+    conversationId: text('conversation_id').references(
+      () => directMessageConversations.id,
+      { onDelete: 'set null' },
+    ),
+    /** Ai trigger notification này */
+    actorId: text('actor_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+
+    isRead: boolean('is_read').notNull().default(false),
+    readAt: timestamp('read_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('notifications_user_workspace_idx').on(table.userId, table.workspaceId),
+    index('notifications_user_unread_idx').on(table.userId, table.isRead),
+    index('notifications_created_at_idx').on(table.createdAt),
+  ],
+)
+
 // ─── Relations ────────────────────────────────────────────────────────────────
 
 export const usersRelations = relations(users, ({ many }) => ({
   accounts: many(accounts),
   workspaceMembers: many(workspaceMembers),
+  conversationMemberships: many(conversationMembers),
 }))
 
 export const accountsRelations = relations(accounts, ({ one }) => ({
@@ -353,6 +903,7 @@ export const accountsRelations = relations(accounts, ({ one }) => ({
 export const workspacesRelations = relations(workspaces, ({ many }) => ({
   members: many(workspaceMembers),
   channels: many(channels),
+  dmConversations: many(directMessageConversations),
 }))
 
 export const workspaceMembersRelations = relations(
@@ -393,16 +944,46 @@ export const channelMembersRelations = relations(channelMembers, ({ one }) => ({
   }),
 }))
 
+export const directMessageConversationsRelations = relations(
+  directMessageConversations,
+  ({ one, many }) => ({
+    workspace: one(workspaces, {
+      fields: [directMessageConversations.workspaceId],
+      references: [workspaces.id],
+    }),
+    members: many(conversationMembers),
+    messages: many(messages),
+    folders: many(channelFolders),
+  }),
+)
+
+export const conversationMembersRelations = relations(
+  conversationMembers,
+  ({ one }) => ({
+    conversation: one(directMessageConversations, {
+      fields: [conversationMembers.conversationId],
+      references: [directMessageConversations.id],
+    }),
+    user: one(users, {
+      fields: [conversationMembers.userId],
+      references: [users.id],
+    }),
+  }),
+)
+
 export const messagesRelations = relations(messages, ({ one, many }) => ({
   channel: one(channels, {
     fields: [messages.channelId],
     references: [channels.id],
   }),
+  conversation: one(directMessageConversations, {
+    fields: [messages.conversationId],
+    references: [directMessageConversations.id],
+  }),
   user: one(users, {
     fields: [messages.userId],
     references: [users.id],
   }),
-  // Self-reference cho thread replies
   parent: one(messages, {
     fields: [messages.parentId],
     references: [messages.id],
@@ -411,7 +992,92 @@ export const messagesRelations = relations(messages, ({ one, many }) => ({
   replies: many(messages, { relationName: 'thread' }),
   reactions: many(reactions),
   attachments: many(attachments),
+  threadSubscriptions: many(threadSubscriptions),
+  mentions: many(mentions),
+  notifications: many(notifications),
 }))
+
+export const mentionsRelations = relations(mentions, ({ one }) => ({
+  message: one(messages, {
+    fields: [mentions.messageId],
+    references: [messages.id],
+  }),
+  workspace: one(workspaces, {
+    fields: [mentions.workspaceId],
+    references: [workspaces.id],
+  }),
+  mentionedUser: one(users, {
+    fields: [mentions.mentionedUserId],
+    references: [users.id],
+  }),
+}))
+
+export const notificationsRelations = relations(notifications, ({ one }) => ({
+  user: one(users, {
+    fields: [notifications.userId],
+    references: [users.id],
+  }),
+  workspace: one(workspaces, {
+    fields: [notifications.workspaceId],
+    references: [workspaces.id],
+  }),
+  message: one(messages, {
+    fields: [notifications.messageId],
+    references: [messages.id],
+  }),
+  channel: one(channels, {
+    fields: [notifications.channelId],
+    references: [channels.id],
+  }),
+  conversation: one(directMessageConversations, {
+    fields: [notifications.conversationId],
+    references: [directMessageConversations.id],
+  }),
+  actor: one(users, {
+    fields: [notifications.actorId],
+    references: [users.id],
+  }),
+}))
+
+export const channelNotificationOverridesRelations = relations(
+  channelNotificationOverrides,
+  ({ one }) => ({
+    user: one(users, {
+      fields: [channelNotificationOverrides.userId],
+      references: [users.id],
+    }),
+    workspace: one(workspaces, {
+      fields: [channelNotificationOverrides.workspaceId],
+      references: [workspaces.id],
+    }),
+    channel: one(channels, {
+      fields: [channelNotificationOverrides.channelId],
+      references: [channels.id],
+    }),
+    conversation: one(directMessageConversations, {
+      fields: [channelNotificationOverrides.conversationId],
+      references: [directMessageConversations.id],
+    }),
+  }),
+)
+
+export const threadSubscriptionsRelations = relations(
+  threadSubscriptions,
+  ({ one }) => ({
+    user: one(users, {
+      fields: [threadSubscriptions.userId],
+      references: [users.id],
+    }),
+    parentMessage: one(messages, {
+      fields: [threadSubscriptions.parentMessageId],
+      references: [messages.id],
+    }),
+    workspace: one(workspaces, {
+      fields: [threadSubscriptions.workspaceId],
+      references: [workspaces.id],
+    }),
+  }),
+)
 
 export const reactionsRelations = relations(reactions, ({ one }) => ({
   message: one(messages, {
@@ -429,8 +1095,43 @@ export const attachmentsRelations = relations(attachments, ({ one, many }) => ({
     fields: [attachments.messageId],
     references: [messages.id],
   }),
+  workspace: one(workspaces, {
+    fields: [attachments.workspaceId],
+    references: [workspaces.id],
+  }),
+  user: one(users, {
+    fields: [attachments.userId],
+    references: [users.id],
+  }),
+  channel: one(channels, {
+    fields: [attachments.channelId],
+    references: [channels.id],
+  }),
+  conversation: one(directMessageConversations, {
+    fields: [attachments.conversationId],
+    references: [directMessageConversations.id],
+  }),
   folderLinks: many(folderAttachments),
+  interactions: many(userFileInteractions),
 }))
+
+export const userFileInteractionsRelations = relations(
+  userFileInteractions,
+  ({ one }) => ({
+    user: one(users, {
+      fields: [userFileInteractions.userId],
+      references: [users.id],
+    }),
+    attachment: one(attachments, {
+      fields: [userFileInteractions.attachmentId],
+      references: [attachments.id],
+    }),
+    workspace: one(workspaces, {
+      fields: [userFileInteractions.workspaceId],
+      references: [workspaces.id],
+    }),
+  }),
+)
 
 export const channelFoldersRelations = relations(
   channelFolders,
@@ -438,6 +1139,10 @@ export const channelFoldersRelations = relations(
     channel: one(channels, {
       fields: [channelFolders.channelId],
       references: [channels.id],
+    }),
+    conversation: one(directMessageConversations, {
+      fields: [channelFolders.conversationId],
+      references: [directMessageConversations.id],
     }),
     createdBy: one(users, {
       fields: [channelFolders.createdById],
@@ -465,6 +1170,26 @@ export const folderAttachmentsRelations = relations(
   }),
 )
 
+export const savedItemsRelations = relations(savedItems, ({ one }) => ({
+  user: one(users, {
+    fields: [savedItems.userId],
+    references: [users.id],
+  }),
+  workspace: one(workspaces, {
+    fields: [savedItems.workspaceId],
+    references: [workspaces.id],
+  }),
+  message: one(messages, {
+    fields: [savedItems.messageId],
+    references: [messages.id],
+  }),
+  attachment: one(attachments, {
+    fields: [savedItems.attachmentId],
+    references: [attachments.id],
+  }),
+}))
+
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type User = typeof users.$inferSelect
@@ -477,13 +1202,43 @@ export type WorkspaceMember = typeof workspaceMembers.$inferSelect
 export type Channel = typeof channels.$inferSelect
 export type NewChannel = typeof channels.$inferInsert
 export type ChannelMember = typeof channelMembers.$inferSelect
+export type DirectMessageConversation =
+  typeof directMessageConversations.$inferSelect
+export type NewDirectMessageConversation =
+  typeof directMessageConversations.$inferInsert
+export type ConversationMember = typeof conversationMembers.$inferSelect
+export type NewConversationMember = typeof conversationMembers.$inferInsert
 export type Message = typeof messages.$inferSelect
 export type NewMessage = typeof messages.$inferInsert
 export type Reaction = typeof reactions.$inferSelect
 export type NewReaction = typeof reactions.$inferInsert
 export type Attachment = typeof attachments.$inferSelect
 export type NewAttachment = typeof attachments.$inferInsert
+export type UserFileInteraction = typeof userFileInteractions.$inferSelect
+export type NewUserFileInteraction = typeof userFileInteractions.$inferInsert
 export type ChannelFolder = typeof channelFolders.$inferSelect
 export type NewChannelFolder = typeof channelFolders.$inferInsert
 export type FolderAttachment = typeof folderAttachments.$inferSelect
 export type NewFolderAttachment = typeof folderAttachments.$inferInsert
+
+export type SavedItem = typeof savedItems.$inferSelect
+export type NewSavedItem = typeof savedItems.$inferInsert
+
+export type MessageDraft = typeof messageDrafts.$inferSelect
+export type NewMessageDraft = typeof messageDrafts.$inferInsert
+
+export type ScheduledMessage = typeof scheduledMessages.$inferSelect
+export type NewScheduledMessage = typeof scheduledMessages.$inferInsert
+
+export type ThreadSubscription = typeof threadSubscriptions.$inferSelect
+
+export type NewThreadSubscription = typeof threadSubscriptions.$inferInsert
+
+export type Mention = typeof mentions.$inferSelect
+export type NewMention = typeof mentions.$inferInsert
+export type Notification = typeof notifications.$inferSelect
+export type NewNotification = typeof notifications.$inferInsert
+export type ChannelNotificationOverride =
+  typeof channelNotificationOverrides.$inferSelect
+export type NewChannelNotificationOverride =
+  typeof channelNotificationOverrides.$inferInsert

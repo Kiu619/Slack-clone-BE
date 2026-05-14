@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common'
-import { ConfigModule } from '@nestjs/config'
+import { ConfigModule, ConfigService } from '@nestjs/config'
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler'
 import { APP_GUARD } from '@nestjs/core'
 import { AppController } from './app.controller'
@@ -16,10 +16,43 @@ import { UploadModule } from './upload/upload.module'
 import { AttachmentModule } from './attachment/attachment.module'
 import { FolderModule } from './folder/folder.module'
 import { UserProfileModule } from './user-profile/user-profile.module'
+import { DirectMessageModule } from './direct-message/direct-message.module';
+import { LaterModule } from './later/later.module';
+import { MessageDraftModule } from './message-draft/message-draft.module';
+import { ScheduledMessageModule } from './scheduled-message/scheduled-message.module';
+import { RecentModule } from './recent/recent.module';
+import { BullModule } from '@nestjs/bullmq';
+import { NotificationModule } from './notification/notification.module';
+
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => {
+        const redisUrl = configService.get<string>('REDIS_URL');
+        if (redisUrl) {
+          const parsed = new URL(redisUrl);
+          return {
+            connection: {
+              host: parsed.hostname,
+              port: parseInt(parsed.port),
+              username: parsed.username || undefined,
+              password: parsed.password || undefined,
+              tls: parsed.protocol === 'rediss:' ? {} : undefined,
+            },
+          };
+        }
+        return {
+          connection: {
+            host: configService.get<string>('REDIS_HOST') || 'localhost',
+            port: parseInt(configService.get<string>('REDIS_PORT') || '6379'),
+          },
+        };
+      },
+    }),
     DatabaseModule,
     RedisModule,
     MailModule,
@@ -32,6 +65,7 @@ import { UserProfileModule } from './user-profile/user-profile.module'
     UploadModule,
     AttachmentModule,
     FolderModule,
+    NotificationModule,
     /**
      * ThrottlerModule — Rate Limiting cho toàn bộ REST API
      *
@@ -58,7 +92,13 @@ import { UserProfileModule } from './user-profile/user-profile.module'
         limit: 10,   // 10 messages / 10s
       },
     ]),
+    DirectMessageModule,
+    LaterModule,
+    MessageDraftModule,
+    ScheduledMessageModule,
+    RecentModule,
   ],
+
   controllers: [AppController],
   providers: [
     AppService,

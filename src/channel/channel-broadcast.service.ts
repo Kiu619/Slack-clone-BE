@@ -1,55 +1,45 @@
-import { Injectable } from '@nestjs/common'
-import { Server } from 'socket.io'
+import { Injectable, Inject, forwardRef } from '@nestjs/common'
+import { UnifiedBroadcastService, EntityDomain, EntityAction } from '../chat/unified-broadcast.service'
 
 /**
- * Broadcast channel CRUD tới room `workspace:${workspaceId}` trên namespace `/channel`.
- * Client join qua ChannelGateway `join-workspace`.
+ * Đồng bộ channel qua `entity:sync` (domain CHANNEL) tới room `workspace:${workspaceId}` trên Main Gateway.
+ * Client join workspace trên namespace mặc định (`/`).
  */
 @Injectable()
 export class ChannelBroadcastService {
-  private server: Server | null = null
-
-  setServer(server: Server) {
-    this.server = server
-  }
-
-  private emitToWorkspace(
-    workspaceId: string,
-    event: string,
-    payload: unknown,
-    excludeSocketId?: string,
-  ) {
-    if (!this.server) return
-    const room = `workspace:${workspaceId}`
-    if (excludeSocketId) {
-      this.server.to(room).except(excludeSocketId).emit(event, payload)
-    } else {
-      this.server.to(room).emit(event, payload)
-    }
-  }
+  constructor(
+    @Inject(forwardRef(() => UnifiedBroadcastService))
+    private readonly unifiedBroadcastService: UnifiedBroadcastService,
+  ) {}
 
   broadcastChannelCreated(
     workspaceId: string,
-    channel: unknown,
+    channel: any,
     excludeSocketId?: string,
   ) {
-    this.emitToWorkspace(
-      workspaceId,
-      'channel:created',
-      { workspaceId, channel },
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId },
+      {
+        domain: EntityDomain.CHANNEL,
+        action: EntityAction.CREATE,
+        payload: { id: channel.id, data: channel, workspaceId },
+      },
       excludeSocketId,
     )
   }
 
   broadcastChannelUpdated(
     workspaceId: string,
-    channel: unknown,
+    channel: any,
     excludeSocketId?: string,
   ) {
-    this.emitToWorkspace(
-      workspaceId,
-      'channel:updated',
-      { workspaceId, channel },
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId },
+      {
+        domain: EntityDomain.CHANNEL,
+        action: EntityAction.UPDATE,
+        payload: { id: channel.id, data: channel, workspaceId },
+      },
       excludeSocketId,
     )
   }
@@ -59,10 +49,13 @@ export class ChannelBroadcastService {
     channelId: string,
     excludeSocketId?: string,
   ) {
-    this.emitToWorkspace(
-      workspaceId,
-      'channel:deleted',
-      { workspaceId, channelId },
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId },
+      {
+        domain: EntityDomain.CHANNEL,
+        action: EntityAction.DELETE,
+        payload: { id: channelId, workspaceId },
+      },
       excludeSocketId,
     )
   }
@@ -79,10 +72,22 @@ export class ChannelBroadcastService {
     },
     excludeSocketId?: string,
   ) {
-    this.emitToWorkspace(
-      workspaceId,
-      'channel:membership:changed',
-      { workspaceId, ...payload },
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId },
+      {
+        domain: EntityDomain.CHANNEL,
+        action: EntityAction.SYNC,
+        payload: {
+          id: payload.channelId,
+          workspaceId,
+          channelId: payload.channelId,
+          data: {
+            kind: 'membership' as const,
+            affectedUserId: payload.affectedUserId,
+            action: payload.action,
+          },
+        },
+      },
       excludeSocketId,
     )
   }

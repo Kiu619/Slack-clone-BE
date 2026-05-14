@@ -27,6 +27,12 @@ import {
   type CreateMessageDto,
   type UpdateMessageDto,
 } from './dto/create-message.dto'
+import {
+  ForwardMessageSchema,
+  type ForwardMessageDto,
+} from './dto/forward-message.dto'
+import { threadSubscriptions } from '@/database/schema'
+import { eq } from 'drizzle-orm'
 
 @Controller()
 @UseGuards(JwtAuthGuard)
@@ -34,7 +40,7 @@ export class MessageController {
   constructor(
     private readonly messageService: MessageService,
     private readonly broadcastService: ChatBroadcastService,
-  ) {}
+  ) { }
 
   /**
    * GET messages — dùng rate limit global (60 req/min) là đủ,
@@ -45,10 +51,11 @@ export class MessageController {
   getMessages(
     @Param('channelId') channelId: string,
     @Query('cursor') cursor: string | undefined,
+    @Query('direction') direction: 'forward' | 'backward' | undefined,
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.getMessages(channelId, userId, cursor)
+    return this.messageService.getMessages({ channelId }, userId, cursor, direction || 'backward')
   }
 
   /**
@@ -63,11 +70,7 @@ export class MessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.listChannelAttachments(
-      channelId,
-      userId,
-      cursor,
-    )
+    return this.messageService.listAttachments({ channelId }, userId, cursor)
   }
 
   /**
@@ -82,11 +85,7 @@ export class MessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.searchChannelFiles(
-      channelId,
-      userId,
-      q ?? '',
-    )
+    return this.messageService.searchFiles({ channelId }, userId, q ?? '')
   }
 
   /**
@@ -101,6 +100,38 @@ export class MessageController {
   }
 
   /**
+   * POST /messages/:messageId/forward
+   * Forward message to multiple channels / DMs (same workspace).
+   */
+  @Post('messages/:messageId/forward')
+  @HttpCode(HttpStatus.CREATED)
+  @Throttle({ message: { ttl: 10000, limit: 10 } })
+  async forwardMessages(
+    @Param('messageId') messageId: string,
+    @Body(new ZodValidationPipe(ForwardMessageSchema)) dto: ForwardMessageDto,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    const list = await this.messageService.forwardMessages(
+      messageId,
+      userId,
+      dto,
+    )
+    for (const message of list) {
+      const m = message as {
+        channelId?: string | null
+        conversationId?: string | null
+      }
+      const room = m.channelId
+        ? `channel:${m.channelId}`
+        : `conversation:${m.conversationId}`
+      this.broadcastService.broadcastMessage(room, message, socketId)
+    }
+    return { messages: list }
+  }
+
+  /**
    * GET /messages/:parentId/replies
    * Lấy danh sách reply trong một thread.
    */
@@ -109,10 +140,11 @@ export class MessageController {
   getThreadMessages(
     @Param('parentId') parentId: string,
     @Query('cursor') cursor: string | undefined,
+    @Query('direction') direction: 'forward' | 'backward' | undefined,
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.getThreadMessages(parentId, userId, cursor)
+    return this.messageService.getThreadMessages(parentId, userId, cursor, direction || 'backward')
   }
 
   /**
@@ -139,13 +171,17 @@ export class MessageController {
   ) {
     const { id: userId } = req.user as { id: string }
     const message = await this.messageService.createMessage(
-      channelId,
+      { channelId },
       userId,
       dto,
     )
 
     // Broadcast tới tất cả TRONG room TRỪ người gửi (nếu có socketId)
-    this.broadcastService.broadcastMessage(channelId, message, socketId)
+    this.broadcastService.broadcastMessage(
+      `channel:${channelId}`,
+      message,
+      socketId,
+    )
 
     return message
   }
@@ -163,11 +199,14 @@ export class MessageController {
       userId,
       dto,
     )
-    this.broadcastService.broadcastMessageUpdated(
-      updated.channelId,
-      updated,
-      socketId,
-    )
+    const room = updated.channelId
+      ? `channel:${updated.channelId}`
+      : `conversation:${updated.conversationId}`
+
+    // Lấy recipientIds đầy đủ (DM members + Thread subscribers) và workspaceId
+    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, updated.parentId)
+
+    this.broadcastService.broadcastMessageUpdated(room, updated, socketId, recipientIds, workspaceId)
     return updated
   }
 
@@ -180,10 +219,17 @@ export class MessageController {
   ) {
     const { id: userId } = req.user as { id: string }
     const result = await this.messageService.deleteMessage(messageId, userId)
+
+    // Lấy recipientIds đầy đủ và workspaceId
+    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+
     this.broadcastService.broadcastMessageDeleted(
-      result.channelId,
+      result.room,
       messageId,
       socketId,
+      (result as any).parentId ?? undefined,
+      recipientIds,
+      workspaceId,
     )
     return result
   }
@@ -202,11 +248,170 @@ export class MessageController {
       userId,
       dto,
     )
+
+    // Lấy recipientIds đầy đủ và workspaceId
+    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+
     this.broadcastService.broadcastReactionUpdate(
-      result.channelId,
-      { messageId, action: result.action, emoji: result.emoji, userId },
+      result.room,
+      {
+        messageId,
+        action: result.action as 'add' | 'remove',
+        emoji: result.emoji,
+        userId,
+        workspaceId
+      },
       socketId,
+      (result as any).parentId ?? undefined,
+      recipientIds,
     )
     return result
+  }
+
+  @Patch('messages/:messageId/pin')
+  async togglePin(
+    @Param('messageId') messageId: string,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    const result = await this.messageService.togglePin(messageId, userId)
+
+    // Lấy recipientIds đầy đủ và workspaceId
+    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+
+    this.broadcastService.broadcastMessagePinned(
+      result.room,
+      { messageId, isPinned: result.isPinned },
+      socketId,
+      (result as any).parentId ?? undefined,
+      recipientIds,
+      workspaceId,
+    )
+    return result
+  }
+
+  @Get('channels/:channelId/pinned')
+  @SkipThrottle({ message: true })
+  getPinnedChannelMessages(
+    @Param('channelId') channelId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.getPinnedMessages({ channelId }, userId)
+  }
+
+  @Get('direct-messages/:conversationId/pinned')
+  @SkipThrottle({ message: true })
+  getPinnedConversationMessages(
+    @Param('conversationId') conversationId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.getPinnedMessages({ conversationId }, userId)
+  }
+
+  /**
+   * GET /workspaces/:workspaceId/direct-messages/:conversationId/attachments?cursor=
+   * Danh sách file trong DM conversation (phân trang), tab Files.
+   */
+  @Get('direct-messages/:conversationId/attachments')
+  @SkipThrottle({ message: true })
+  listConversationAttachments(
+    @Param('conversationId') conversationId: string,
+    @Query('cursor') cursor: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.listAttachments(
+      { conversationId },
+      userId,
+      cursor,
+    )
+  }
+
+  /**
+   * GET /workspaces/:workspaceId/direct-messages/:conversationId/files/search?q=
+   * Tìm attachment theo tên trong DM conversation (tab Files).
+   */
+  @Get('direct-messages/:conversationId/files/search')
+  @SkipThrottle({ message: true })
+  searchConversationFiles(
+    @Param('conversationId') conversationId: string,
+    @Query('q') q: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.searchFiles({ conversationId }, userId, q ?? '')
+  }
+
+  @Get('direct-messages/:conversationId/messages')
+  @SkipThrottle({ message: true })
+  getDirectMessages(
+    @Param('conversationId') conversationId: string,
+    @Query('cursor') cursor: string | undefined,
+    @Query('direction') direction: 'forward' | 'backward' | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.getMessages({ conversationId }, userId, cursor, direction || 'backward')
+  }
+
+  @Get('workspaces/:workspaceId/threads')
+  @SkipThrottle({ message: true })
+  getThreads(
+    @Param('workspaceId') workspaceId: string,
+    @Query('cursor') cursor: string | undefined,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.getThreads(workspaceId, userId, cursor)
+  }
+
+  @Patch('messages/:parentId/threads/read')
+  @HttpCode(HttpStatus.OK)
+  async markThreadAsRead(@Param('parentId') parentId: string, @Req() req: Request) {
+    const { id: userId } = req.user as { id: string }
+    await this.messageService.markThreadAsRead(parentId, userId)
+    return { success: true }
+  }
+
+  @Post('direct-messages/messages')
+  @HttpCode(HttpStatus.CREATED)
+  async createDirectMessageWithoutId(
+    @Body(new ZodValidationPipe(CreateMessageSchema)) dto: CreateMessageDto,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    const message = await this.messageService.createMessage({}, userId, dto)
+    this.broadcastService.broadcastMessage(
+      `conversation:${message.conversationId}`,
+      message,
+      socketId,
+    )
+    return message
+  }
+
+  @Post('direct-messages/:conversationId/messages')
+  @HttpCode(HttpStatus.CREATED)
+  async createDirectMessage(
+    @Param('conversationId') conversationId: string,
+    @Body(new ZodValidationPipe(CreateMessageSchema)) dto: CreateMessageDto,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    const message = await this.messageService.createMessage(
+      { conversationId },
+      userId,
+      dto,
+    )
+    this.broadcastService.broadcastMessage(
+      `conversation:${conversationId}`,
+      message,
+      socketId,
+    )
+    return message
   }
 }

@@ -12,12 +12,15 @@ import {
   Query,
   Req,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common'
 import type { Request } from 'express'
 import { Throttle, SkipThrottle } from '@nestjs/throttler'
 import { MessageService } from './message.service'
 import { ChatBroadcastService } from '../chat/chat-broadcast.service'
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
+import { Idempotent } from '../auth/decorators/idempotent.decorator'
+import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor'
 import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe'
 import {
   AddReactionSchema,
@@ -31,16 +34,19 @@ import {
   ForwardMessageSchema,
   type ForwardMessageDto,
 } from './dto/forward-message.dto'
-import { threadSubscriptions } from '@/database/schema'
-import { eq } from 'drizzle-orm'
+import {
+  SearchWorkspaceMessagesSchema,
+  type SearchWorkspaceMessagesDto,
+} from './dto/search-workspace-messages.dto'
 
 @Controller()
 @UseGuards(JwtAuthGuard)
+@UseInterceptors(IdempotencyInterceptor)
 export class MessageController {
   constructor(
     private readonly messageService: MessageService,
     private readonly broadcastService: ChatBroadcastService,
-  ) { }
+  ) {}
 
   /**
    * GET messages — dùng rate limit global (60 req/min) là đủ,
@@ -55,7 +61,12 @@ export class MessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.getMessages({ channelId }, userId, cursor, direction || 'backward')
+    return this.messageService.getMessages(
+      { channelId },
+      userId,
+      cursor,
+      direction || 'backward',
+    )
   }
 
   /**
@@ -106,6 +117,8 @@ export class MessageController {
   @Post('messages/:messageId/forward')
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ message: { ttl: 10000, limit: 10 } })
+  @Idempotent(300)
+  @UseInterceptors(IdempotencyInterceptor)
   async forwardMessages(
     @Param('messageId') messageId: string,
     @Body(new ZodValidationPipe(ForwardMessageSchema)) dto: ForwardMessageDto,
@@ -144,7 +157,12 @@ export class MessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.getThreadMessages(parentId, userId, cursor, direction || 'backward')
+    return this.messageService.getThreadMessages(
+      parentId,
+      userId,
+      cursor,
+      direction || 'backward',
+    )
   }
 
   /**
@@ -163,6 +181,7 @@ export class MessageController {
   @Post('channels/:channelId/messages')
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ message: { ttl: 10000, limit: 10 } })
+  @Idempotent(60)
   async createMessage(
     @Param('channelId') channelId: string,
     @Body(new ZodValidationPipe(CreateMessageSchema)) dto: CreateMessageDto,
@@ -204,9 +223,16 @@ export class MessageController {
       : `conversation:${updated.conversationId}`
 
     // Lấy recipientIds đầy đủ (DM members + Thread subscribers) và workspaceId
-    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, updated.parentId)
+    const { recipientIds, workspaceId } =
+      await this.messageService.getRecipientIds(messageId, updated.parentId)
 
-    this.broadcastService.broadcastMessageUpdated(room, updated, socketId, recipientIds, workspaceId)
+    this.broadcastService.broadcastMessageUpdated(
+      room,
+      updated,
+      socketId,
+      recipientIds,
+      workspaceId,
+    )
     return updated
   }
 
@@ -221,13 +247,14 @@ export class MessageController {
     const result = await this.messageService.deleteMessage(messageId, userId)
 
     // Lấy recipientIds đầy đủ và workspaceId
-    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+    const { recipientIds, workspaceId } =
+      await this.messageService.getRecipientIds(messageId, result.parentId)
 
     this.broadcastService.broadcastMessageDeleted(
       result.room,
       messageId,
       socketId,
-      (result as any).parentId ?? undefined,
+      result.parentId ?? undefined,
       recipientIds,
       workspaceId,
     )
@@ -236,6 +263,7 @@ export class MessageController {
 
   @Post('messages/:messageId/reactions')
   @HttpCode(HttpStatus.OK)
+  @Idempotent(60)
   async toggleReaction(
     @Param('messageId') messageId: string,
     @Body(new ZodValidationPipe(AddReactionSchema)) dto: AddReactionDto,
@@ -250,7 +278,8 @@ export class MessageController {
     )
 
     // Lấy recipientIds đầy đủ và workspaceId
-    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+    const { recipientIds, workspaceId } =
+      await this.messageService.getRecipientIds(messageId, result.parentId)
 
     this.broadcastService.broadcastReactionUpdate(
       result.room,
@@ -259,10 +288,23 @@ export class MessageController {
         action: result.action as 'add' | 'remove',
         emoji: result.emoji,
         userId,
-        workspaceId
+        workspaceId,
+        reactions: result.reactions as
+          | Array<{
+              emoji: string
+              count: number
+              userIds: string[]
+              users: Array<{
+                id: string
+                name: string | null
+                displayName: string | null
+                avatar: string | null
+              }>
+            }>
+          | undefined,
       },
       socketId,
-      (result as any).parentId ?? undefined,
+      result.parentId ?? undefined,
       recipientIds,
     )
     return result
@@ -278,13 +320,14 @@ export class MessageController {
     const result = await this.messageService.togglePin(messageId, userId)
 
     // Lấy recipientIds đầy đủ và workspaceId
-    const { recipientIds, workspaceId } = await this.messageService.getRecipientIds(messageId, (result as any).parentId)
+    const { recipientIds, workspaceId } =
+      await this.messageService.getRecipientIds(messageId, result.parentId)
 
     this.broadcastService.broadcastMessagePinned(
       result.room,
       { messageId, isPinned: result.isPinned },
       socketId,
-      (result as any).parentId ?? undefined,
+      result.parentId ?? undefined,
       recipientIds,
       workspaceId,
     )
@@ -354,7 +397,12 @@ export class MessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.messageService.getMessages({ conversationId }, userId, cursor, direction || 'backward')
+    return this.messageService.getMessages(
+      { conversationId },
+      userId,
+      cursor,
+      direction || 'backward',
+    )
   }
 
   @Get('workspaces/:workspaceId/threads')
@@ -368,9 +416,28 @@ export class MessageController {
     return this.messageService.getThreads(workspaceId, userId, cursor)
   }
 
+  @Get('workspaces/:workspaceId/search/messages')
+  @SkipThrottle({ message: true })
+  searchWorkspaceMessages(
+    @Param('workspaceId') workspaceId: string,
+    @Query(new ZodValidationPipe(SearchWorkspaceMessagesSchema))
+    query: SearchWorkspaceMessagesDto,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.messageService.searchWorkspaceMessages(
+      workspaceId,
+      userId,
+      query,
+    )
+  }
+
   @Patch('messages/:parentId/threads/read')
   @HttpCode(HttpStatus.OK)
-  async markThreadAsRead(@Param('parentId') parentId: string, @Req() req: Request) {
+  async markThreadAsRead(
+    @Param('parentId') parentId: string,
+    @Req() req: Request,
+  ) {
     const { id: userId } = req.user as { id: string }
     await this.messageService.markThreadAsRead(parentId, userId)
     return { success: true }
@@ -378,6 +445,7 @@ export class MessageController {
 
   @Post('direct-messages/messages')
   @HttpCode(HttpStatus.CREATED)
+  @Idempotent(60)
   async createDirectMessageWithoutId(
     @Body(new ZodValidationPipe(CreateMessageSchema)) dto: CreateMessageDto,
     @Req() req: Request,
@@ -395,6 +463,7 @@ export class MessageController {
 
   @Post('direct-messages/:conversationId/messages')
   @HttpCode(HttpStatus.CREATED)
+  @Idempotent(60)
   async createDirectMessage(
     @Param('conversationId') conversationId: string,
     @Body(new ZodValidationPipe(CreateMessageSchema)) dto: CreateMessageDto,

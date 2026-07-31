@@ -6,6 +6,7 @@ import { ChannelBroadcastService } from './channel-broadcast.service'
 import { DatabaseModule } from '../database/database.module'
 import { ChatModule } from '../chat/chat.module'
 import { MessageModule } from '../message/message.module'
+import { WorkspacePermissionsModule } from '../workspace/workspace-permissions.module'
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { MessageModule } from '../message/message.module'
     JwtModule,
     forwardRef(() => ChatModule),
     forwardRef(() => MessageModule),
+    WorkspacePermissionsModule,
   ],
   controllers: [ChannelController],
   providers: [ChannelService, ChannelBroadcastService],

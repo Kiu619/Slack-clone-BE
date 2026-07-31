@@ -1,28 +1,29 @@
 import {
-  Controller,
-  Get,
-  Post,
-  Body,
-  Req,
-  Res,
-  UseGuards,
-  HttpCode,
-  HttpStatus,
+    Body,
+    Controller,
+    Get,
+    HttpCode,
+    HttpStatus,
+    Post,
+    Req,
+    Res,
+    UseGuards,
 } from '@nestjs/common'
-import type { Request, Response } from 'express'
 import { ConfigService } from '@nestjs/config'
-import { AuthService } from './auth.service'
-import { GoogleOAuthGuard } from './guards/google-oauth.guard'
-import { GithubOAuthGuard } from './guards/github-oauth.guard'
-import { JwtAuthGuard } from './guards/jwt-auth.guard'
-import { JwtRefreshGuard } from './guards/jwt-refresh.guard'
+import type { Request, Response } from 'express'
+import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe';
+import { AuthService } from './auth.service';
+import { Public } from './decorators/public.decorator';
+import { SkipWorkspaceMemberCheck } from './decorators/skip-workspace-member-check.decorator';
 import {
-  MagicLinkSchema,
-  MagicLinkVerifySchema,
-  type MagicLinkDto,
-  type MagicLinkVerifyDto,
-} from './dto/magic-link.dto'
-import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe'
+    MagicLinkSchema,
+    MagicLinkVerifySchema,
+    type MagicLinkDto,
+    type MagicLinkVerifyDto,
+} from './dto/magic-link.dto';
+import { GithubOAuthGuard } from './guards/github-oauth.guard';
+import { GoogleOAuthGuard } from './guards/google-oauth.guard';
+import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
 
 @Controller('auth')
 export class AuthController {
@@ -31,11 +32,41 @@ export class AuthController {
     private config: ConfigService,
   ) {}
 
+  @Post('google/init')
+  @Public()
+  @SkipWorkspaceMemberCheck()
+  @HttpCode(HttpStatus.OK)
+  initGoogle(
+    @Body() body: { redirect?: string },
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const redirect = this.authService.sanitizeRedirectPath(body?.redirect)
+    this.authService.setOAuthRedirectCookie(res, redirect)
+    return { ok: true }
+  }
+
+  @Post('github/init')
+  @Public()
+  @SkipWorkspaceMemberCheck()
+  @HttpCode(HttpStatus.OK)
+  initGithub(
+    @Body() body: { redirect?: string },
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const redirect = this.authService.sanitizeRedirectPath(body?.redirect)
+    this.authService.setOAuthRedirectCookie(res, redirect)
+    return { ok: true }
+  }
+
   @Get('google')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @UseGuards(GoogleOAuthGuard)
   googleAuth() {}
 
   @Get('google/callback')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @UseGuards(GoogleOAuthGuard)
   googleCallback(@Req() req: Request, @Res() res: Response) {
     const user = req.user as {
@@ -51,16 +82,24 @@ export class AuthController {
       user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
-    res.redirect(
-      `${this.config.get('FRONTEND_URL')}/auth/callback?success=true`,
-    )
+
+    const redirect = this.authService.readOAuthRedirectCookie(req)
+    this.authService.clearOAuthRedirectCookie(res)
+
+    const params = new URLSearchParams({ success: 'true' })
+    if (redirect) params.set('redirect', redirect)
+    res.redirect(`${this.config.get('FRONTEND_URL')}/auth/callback?${params}`)
   }
 
   @Get('github')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @UseGuards(GithubOAuthGuard)
   githubAuth() {}
 
   @Get('github/callback')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @UseGuards(GithubOAuthGuard)
   githubCallback(@Req() req: Request, @Res() res: Response) {
     const user = req.user as {
@@ -76,27 +115,33 @@ export class AuthController {
       user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
-    res.redirect(
-      `${this.config.get('FRONTEND_URL')}/auth/callback?success=true`,
-    )
+
+    const redirect = this.authService.readOAuthRedirectCookie(req)
+    this.authService.clearOAuthRedirectCookie(res)
+
+    const params = new URLSearchParams({ success: 'true' })
+    if (redirect) params.set('redirect', redirect)
+    res.redirect(`${this.config.get('FRONTEND_URL')}/auth/callback?${params}`)
   }
 
   @Post('magic-link/send')
+  @Public()
   @HttpCode(HttpStatus.OK)
   async sendMagicLink(
     @Body(new ZodValidationPipe(MagicLinkSchema)) dto: MagicLinkDto,
   ) {
-    await this.authService.sendMagicLink(dto.email)
+    await this.authService.sendMagicLink(dto.email, dto.redirect ?? undefined)
     return { message: 'Magic link sent to your email' }
   }
 
   @Post('magic-link/verify')
+  @Public()
   @HttpCode(HttpStatus.OK)
   async verifyMagicLink(
     @Body(new ZodValidationPipe(MagicLinkVerifySchema)) dto: MagicLinkVerifyDto,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const user = await this.authService.verifyMagicLink(dto.token)
+    const { user, redirect } = await this.authService.verifyMagicLink(dto.token)
     const { accessToken, refreshToken } = this.authService.generateTokens(
       user.id,
       user.email,
@@ -105,7 +150,7 @@ export class AuthController {
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     const account = await this.authService.getAccountById(user.id)
-    return { user: account }
+    return { user: account, redirect }
   }
 
   @Post('refresh')
@@ -129,7 +174,6 @@ export class AuthController {
   }
 
   @Post('sign-out')
-  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   signOut(@Res({ passthrough: true }) res: Response) {
     this.authService.clearTokenCookies(res)
@@ -138,7 +182,6 @@ export class AuthController {
 
   /** Chỉ thông tin tài khoản (email, default name/avatar). Profile workspace: `GET user-profile/me?workspaceId=` */
   @Get('me')
-  @UseGuards(JwtAuthGuard)
   async getMe(@Req() req: Request) {
     const { id: userId } = req.user as { id: string }
     const account = await this.authService.getAccountById(userId)

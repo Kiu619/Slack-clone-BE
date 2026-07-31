@@ -12,6 +12,7 @@ import type { UpdateContactDto } from './dto/update-contact.dto'
 import type { UpdateAboutMeDto } from './dto/update-about-me.dto'
 import { RedisService } from '../redis/redis.service'
 import { UserProfileBroadcastService } from './user-profile-broadcast.service'
+import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 
 @Injectable()
 export class UserProfileService {
@@ -19,7 +20,8 @@ export class UserProfileService {
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly redis: RedisService,
     private readonly profileBroadcastService: UserProfileBroadcastService,
-  ) { }
+    private readonly permissionsService: WorkspacePermissionsService,
+  ) {}
 
   private async assertWorkspaceMember(workspaceId: string, userId: string) {
     const [m] = await this.db
@@ -62,6 +64,8 @@ export class UserProfileService {
         wmName: workspaceMembers.name,
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
+        role: workspaceMembers.role,
+        membershipStatus: workspaceMembers.membershipStatus,
         isAway: workspaceMembers.isAway,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
@@ -95,6 +99,30 @@ export class UserProfileService {
     dto: UpdateProfileDto,
   ) {
     await this.assertWorkspaceMember(workspaceId, userId)
+
+    if (dto.name !== undefined) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'update_name',
+      )
+    }
+
+    if (dto.displayName !== undefined) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'update_display_name',
+      )
+    }
+
+    if (dto.avatar !== undefined) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'allow_profile_photo_edits',
+      )
+    }
 
     const [updated] = await this.db
       .update(workspaceMembers)
@@ -131,6 +159,8 @@ export class UserProfileService {
         wmName: workspaceMembers.name,
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
+        role: workspaceMembers.role,
+        membershipStatus: workspaceMembers.membershipStatus,
         isAway: workspaceMembers.isAway,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
@@ -195,6 +225,8 @@ export class UserProfileService {
         wmName: workspaceMembers.name,
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
+        role: workspaceMembers.role,
+        membershipStatus: workspaceMembers.membershipStatus,
         isAway: workspaceMembers.isAway,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
@@ -259,6 +291,8 @@ export class UserProfileService {
         wmName: workspaceMembers.name,
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
+        role: workspaceMembers.role,
+        membershipStatus: workspaceMembers.membershipStatus,
         isAway: workspaceMembers.isAway,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
@@ -298,6 +332,8 @@ export class UserProfileService {
     wmName: string | null
     wmAvatar: string | null
     displayName: string | null
+    role: 'owner' | 'admin' | 'member' | 'primary_owner'
+    membershipStatus: 'active' | 'deactivated'
     isAway: boolean
     namePronunciation: string | null
     phone: string | null
@@ -317,6 +353,8 @@ export class UserProfileService {
       name,
       displayName: row.displayName ?? name,
       avatar,
+      role: row.role,
+      membershipStatus: row.membershipStatus,
       isAway: row.isAway,
       namePronunciation: row.namePronunciation,
       phone: row.phone,

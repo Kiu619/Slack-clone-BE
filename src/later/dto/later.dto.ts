@@ -1,18 +1,24 @@
 import { z } from 'zod'
 
-export const SaveItemSchema = z.object({
-  type: z.enum(['message', 'attachment', 'reminder']),
-  messageId: z.string().uuid().optional(),
-  attachmentId: z.string().uuid().optional(),
-  note: z.string().optional(),
-  remindAt: z.string().datetime().optional(),
-}).refine(data => {
-  if (data.type === 'reminder') return !!data.note
-  return data.messageId || data.attachmentId
-}, {
-  message: "Either messageId, attachmentId or note (for reminder) must be provided",
-  path: ["messageId"]
-})
+export const SaveItemSchema = z
+  .object({
+    type: z.enum(['message', 'attachment', 'reminder']),
+    messageId: z.string().uuid().optional(),
+    attachmentId: z.string().uuid().optional(),
+    note: z.string().optional(),
+    remindAt: z.string().datetime().optional(),
+  })
+  .refine(
+    (data) => {
+      if (data.type === 'reminder') return !!data.note
+      return data.messageId || data.attachmentId
+    },
+    {
+      message:
+        'Either messageId, attachmentId or note (for reminder) must be provided',
+      path: ['messageId'],
+    },
+  )
 
 export type SaveItemDto = z.infer<typeof SaveItemSchema>
 

@@ -21,7 +21,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "seed:mock-workspace-users": "ts-node src/scripts/seed-mock-workspace-users.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1004.0",
@@ -46,6 +47,7 @@
     "cookie-parser": "^1.4.7",
     "drizzle-orm": "^0.45.1",
     "ioredis": "^5.10.0",
+    "livekit-server-sdk": "^2.15.4",
     "nodemailer": "^8.0.1",
     "passport": "^0.7.0",
     "passport-github2": "^0.1.12",

@@ -1,5 +1,10 @@
 import { Injectable, Inject, forwardRef } from '@nestjs/common'
-import { UnifiedBroadcastService, EntityDomain, EntityAction } from '../chat/unified-broadcast.service'
+import {
+  UnifiedBroadcastService,
+  EntityDomain,
+  EntityAction,
+} from '../chat/unified-broadcast.service'
+import { Channel } from '../database/schema'
 
 /**
  * Đồng bộ channel qua `entity:sync` (domain CHANNEL) tới room `workspace:${workspaceId}` trên Main Gateway.
@@ -14,7 +19,7 @@ export class ChannelBroadcastService {
 
   broadcastChannelCreated(
     workspaceId: string,
-    channel: any,
+    channel: Channel,
     excludeSocketId?: string,
   ) {
     this.unifiedBroadcastService.syncEntity(
@@ -30,7 +35,7 @@ export class ChannelBroadcastService {
 
   broadcastChannelUpdated(
     workspaceId: string,
-    channel: any,
+    channel: Channel,
     excludeSocketId?: string,
   ) {
     this.unifiedBroadcastService.syncEntity(

@@ -49,7 +49,8 @@ export class MessageDraftController {
   @Put()
   upsert(
     @Param('workspaceId') workspaceId: string,
-    @Body(new ZodValidationPipe(UpsertMessageDraftSchema)) dto: UpsertMessageDraftDto,
+    @Body(new ZodValidationPipe(UpsertMessageDraftSchema))
+    dto: UpsertMessageDraftDto,
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {

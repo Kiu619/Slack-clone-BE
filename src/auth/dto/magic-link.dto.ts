@@ -1,10 +1,9 @@
 import { z } from 'zod'
-import {
-  isValidTimeZoneValue,
-} from '../../common/constants/timezone.constants'
+import { isValidTimeZoneValue } from '../../common/constants/timezone.constants'
 
 export const MagicLinkSchema = z.object({
   email: z.email('Invalid email address'),
+  redirect: z.string().optional(),
 })
 
 export type MagicLinkDto = z.infer<typeof MagicLinkSchema>

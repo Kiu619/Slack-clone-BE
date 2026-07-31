@@ -1,42 +1,42 @@
 import { z } from 'zod'
 
-export const CreateMessageSchema = z.object({
-  content: z
-    .string()
-    .max(40000, 'Tin nhắn quá dài (tối đa 40,000 ký tự)'),
-  /** parentId: nếu có → reply trong thread */
-  parentId: z.string().optional(),
-  /** alsoSendToChannel: nếu true → reply cũng được gửi ra channel chính */
-  alsoSendToChannel: z.boolean().optional(),
-  /** userIds: dùng cho trường hợp gửi tin nhắn đầu tiên để tạo DM conversation */
-  userIds: z.array(z.string().uuid()).optional(),
-  /** workspaceId: dùng kèm với userIds */
-  workspaceId: z.string().uuid().optional(),
-  /** attachments: danh sách file đính kèm đã upload lên S3/Cloudinary */
-  attachments: z
-    .array(
-      z.object({
-        url: z.string().url(),
-        type: z.enum(['image', 'video', 'audio', 'file']),
-        name: z.string(),
-        size: z.number(),
-        mimeType: z.string().optional(),
-        width: z.number().optional(),
-        height: z.number().optional(),
-        duration: z.number().optional(),
-        fileCategory: z.string().optional(),
-      }),
-    )
-    .optional(),
-}).refine(
-  (data) =>
-    data.content.trim().length > 0 ||
-    (data.attachments && data.attachments.length > 0),
-  {
-    message: 'Nội dung hoặc file đính kèm không được để trống',
-    path: ['content'],
-  },
-)
+export const CreateMessageSchema = z
+  .object({
+    content: z.string().max(40000, 'Tin nhắn quá dài (tối đa 40,000 ký tự)'),
+    /** parentId: nếu có → reply trong thread */
+    parentId: z.string().optional(),
+    /** alsoSendToChannel: nếu true → reply cũng được gửi ra channel chính */
+    alsoSendToChannel: z.boolean().optional(),
+    /** userIds: dùng cho trường hợp gửi tin nhắn đầu tiên để tạo DM conversation */
+    userIds: z.array(z.string().uuid()).optional(),
+    /** workspaceId: dùng kèm với userIds */
+    workspaceId: z.string().uuid().optional(),
+    /** attachments: danh sách file đính kèm đã upload lên S3/Cloudinary */
+    attachments: z
+      .array(
+        z.object({
+          url: z.string().url(),
+          type: z.enum(['image', 'video', 'audio', 'file']),
+          name: z.string(),
+          size: z.number(),
+          mimeType: z.string().optional(),
+          width: z.number().optional(),
+          height: z.number().optional(),
+          duration: z.number().optional(),
+          fileCategory: z.string().optional(),
+        }),
+      )
+      .optional(),
+  })
+  .refine(
+    (data) =>
+      data.content.trim().length > 0 ||
+      (data.attachments && data.attachments.length > 0),
+    {
+      message: 'Nội dung hoặc file đính kèm không được để trống',
+      path: ['content'],
+    },
+  )
 
 export type CreateMessageDto = z.infer<typeof CreateMessageSchema>
 

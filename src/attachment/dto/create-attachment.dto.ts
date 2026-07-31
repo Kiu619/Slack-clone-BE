@@ -8,7 +8,14 @@ export const CreateAttachmentSchema = z.object({
   workspaceId: z.uuid(' Workspace ID must be a UUID'),
   channelId: z.uuid().optional().nullable(),
   conversationId: z.uuid().optional().nullable(),
-  url: z.url(' URL is not valid'),
+  url: z.url(' URL is not valid').refine((value) => {
+    try {
+      const parsed = new URL(value)
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+    } catch {
+      return false
+    }
+  }, ' URL must use http/https protocol'),
   type: z.enum(['image', 'video', 'audio', 'file']),
   fileCategory: z
     .enum([

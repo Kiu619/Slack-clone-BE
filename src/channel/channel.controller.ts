@@ -13,10 +13,13 @@ import {
   Query,
   Req,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common'
 import type { Request } from 'express'
 import { ChannelService } from './channel.service'
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
+import { Idempotent } from '../auth/decorators/idempotent.decorator'
+import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor'
 import {
   CreateChannelSchema,
   type CreateChannelDto,
@@ -34,6 +37,7 @@ import { ChannelBroadcastService } from './channel-broadcast.service'
 
 @Controller('workspaces/:workspaceId/channels')
 @UseGuards(JwtAuthGuard)
+@UseInterceptors(IdempotencyInterceptor)
 export class ChannelController {
   constructor(
     private readonly channelService: ChannelService,
@@ -42,6 +46,7 @@ export class ChannelController {
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
+  @Idempotent(300)
   async create(
     @Param('workspaceId') workspaceId: string,
     @Req() req: Request,
@@ -59,9 +64,26 @@ export class ChannelController {
   }
 
   @Get()
-  findAll(@Param('workspaceId') workspaceId: string, @Req() req: Request) {
+  findAll(
+    @Param('workspaceId') workspaceId: string,
+    @Req() req: Request,
+    @Query('withUserIds') withUserIdsRaw?: string | string[],
+  ) {
     const { id: userId } = req.user as { id: string }
-    return this.channelService.findAllByWorkspace(workspaceId, userId)
+    const withUserIds = Array.isArray(withUserIdsRaw)
+      ? withUserIdsRaw
+          .flatMap((value) => value.split(','))
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+      : (withUserIdsRaw
+          ?.split(',')
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0) ?? [])
+    return this.channelService.findAllByWorkspace(
+      workspaceId,
+      userId,
+      withUserIds,
+    )
   }
 
   @Get(':channelId/member-status')

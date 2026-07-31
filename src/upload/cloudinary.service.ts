@@ -1,6 +1,14 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { v2 as cloudinary } from 'cloudinary'
+
+type CloudinaryResourceType = 'image' | 'video' | 'raw'
+
+type CloudinaryDeleteTarget = {
+  publicId: string
+  resourceType: CloudinaryResourceType
+}
+
 @Injectable()
 export class CloudinaryService implements OnModuleInit {
   private readonly logger = new Logger(CloudinaryService.name)
@@ -93,22 +101,120 @@ export class CloudinaryService implements OnModuleInit {
   }
 
   /**
-   * Parse Cloudinary URL để lấy public_id (dùng cho delete)
+   * Parse Cloudinary URL để lấy public_id + resource type (dùng cho delete).
+   * Hỗ trợ cả image/video upload URL và bỏ qua query string.
+   */
+  extractDeleteTarget(url: string): CloudinaryDeleteTarget | null {
+    try {
+      const parsed = new URL(url)
+      const segments = parsed.pathname.split('/').filter(Boolean)
+      const cloudNameIndex = segments.indexOf(this.cloudName)
+
+      if (cloudNameIndex < 0) return null
+
+      const resourceType = segments[
+        cloudNameIndex + 1
+      ] as CloudinaryResourceType
+      const action = segments[cloudNameIndex + 2]
+      if (
+        !['image', 'video', 'raw'].includes(resourceType) ||
+        action !== 'upload'
+      ) {
+        return null
+      }
+
+      const versionIndex = cloudNameIndex + 3
+      const version = segments[versionIndex]
+      if (!version?.startsWith('v')) return null
+
+      const encodedPublicId = segments.slice(versionIndex + 1).join('/')
+      if (!encodedPublicId) return null
+
+      const publicId = encodedPublicId.replace(/\.[^.]+$/, '')
+      return { publicId, resourceType }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Parse Cloudinary URL để lấy public_id (dùng cho code cũ)
    */
   extractPublicId(url: string): string | null {
-    const match = url.match(/\/v\d+\/(.+)\.\w+$/)
-    return match ? match[1] : null
+    return this.extractDeleteTarget(url)?.publicId ?? null
   }
 
   /**
    * Delete file từ Cloudinary (dùng khi xóa attachment)
    */
-  async deleteFile(publicId: string): Promise<void> {
+  async deleteFile(
+    publicId: string,
+    resourceType: CloudinaryResourceType = 'image',
+  ): Promise<boolean> {
     try {
-      await cloudinary.uploader.destroy(publicId)
-      this.logger.log(`Deleted file from Cloudinary: ${publicId}`)
+      const result = await cloudinary.uploader.destroy(publicId, {
+        resource_type: resourceType,
+        invalidate: true,
+      })
+
+      if (result?.result === 'ok') {
+        this.logger.log(
+          `Deleted file from Cloudinary: ${resourceType}/${publicId}`,
+        )
+        return true
+      }
+
+      if (result?.result === 'not found') {
+        this.logger.warn(
+          `Cloudinary file already missing: ${resourceType}/${publicId}`,
+        )
+        return false
+      }
+
+      this.logger.warn(
+        `Cloudinary delete returned unexpected result for ${resourceType}/${publicId}: ${JSON.stringify(result)}`,
+      )
+      return false
     } catch (error) {
-      this.logger.error(`Failed to delete file: ${publicId}`, error)
+      this.logger.error(
+        `Failed to delete file from Cloudinary: ${resourceType}/${publicId}`,
+        error,
+      )
+      throw error
     }
+  }
+
+  async uploadOfficePreviewPdf(
+    filePath: string,
+    attachmentId: string,
+    workspaceId: string,
+  ): Promise<{ publicId: string; thumbnailUrl: string }> {
+    const uploadResult = await cloudinary.uploader.upload(filePath, {
+      resource_type: 'image',
+      format: 'pdf',
+      folder: `slack/office-previews/${workspaceId}`,
+      public_id: attachmentId,
+      overwrite: true,
+      use_filename: false,
+      unique_filename: false,
+    })
+
+    const publicId = uploadResult.public_id
+    const thumbnailUrl = cloudinary.url(publicId, {
+      secure: true,
+      resource_type: 'image',
+      format: 'jpg',
+      page: '1',
+      transformation: [
+        {
+          width: 1200,
+          crop: 'limit',
+          quality: 'auto:good',
+          fetch_format: 'auto',
+        },
+      ],
+    })
+
+    return { publicId, thumbnailUrl }
   }
 }

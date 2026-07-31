@@ -27,6 +27,16 @@ import type { UploadFileToFolderDto } from './dto/folder.dto'
 
 const FOLDER_ATTACHMENTS_PAGE_SIZE = 30
 
+const removedFolderAuthorNameExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`
+const removedFolderAuthorDisplayNameExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`
+const removedFolderAuthorAvatarExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN NULL ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar}) END`
+
 type ChannelFileJoinRow = {
   attId: string
   attMessageId: string
@@ -74,6 +84,49 @@ export class FolderService {
     private readonly redis: RedisService,
     private readonly broadcastService: ChatBroadcastService,
   ) {}
+
+  private resolveAttachmentFileCategory(
+    name: string,
+    mimeType?: string | null,
+    fileCategory?: string | null,
+  ) {
+    if (fileCategory) return fileCategory
+
+    const ext = name.split('.').pop()?.toLowerCase()
+    if (ext) {
+      if (['xlsx', 'xls', 'csv', 'ods'].includes(ext)) return 'spreadsheet'
+      if (['pptx', 'ppt', 'odp'].includes(ext)) return 'presentation'
+      if (['doc', 'docx', 'odt', 'rtf', 'txt'].includes(ext)) return 'document'
+    }
+
+    if (!mimeType) return 'other'
+    if (
+      mimeType.includes('spreadsheet') ||
+      mimeType.includes('excel') ||
+      mimeType.includes('sheet') ||
+      mimeType.includes('csv')
+    ) {
+      return 'spreadsheet'
+    }
+    if (
+      mimeType.includes('presentation') ||
+      mimeType.includes('powerpoint') ||
+      mimeType.includes('officedocument.presentationml')
+    ) {
+      return 'presentation'
+    }
+    if (
+      mimeType.includes('word') ||
+      mimeType.includes('officedocument.wordprocessingml') ||
+      mimeType === 'application/msword' ||
+      mimeType.includes('document') ||
+      mimeType.includes('wordprocessingml')
+    ) {
+      return 'document'
+    }
+
+    return 'other'
+  }
 
   private folderChatRoom(target: {
     channelId?: string
@@ -161,7 +214,8 @@ export class FolderService {
 
     if (!row) throw new NotFoundException('Channel not found')
     if (!row.wsMemberId) throw new ForbiddenException('Not a workspace member')
-    if (!row.chMemberId && row.isPrivate) throw new ForbiddenException('Not a channel member')
+    if (!row.chMemberId && row.isPrivate)
+      throw new ForbiddenException('Not a channel member')
 
     return row
   }
@@ -470,15 +524,9 @@ export class FolderService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
-        userAvatar: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-        userDisplayName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userName: removedFolderAuthorNameExpr,
+        userAvatar: removedFolderAuthorAvatarExpr,
+        userDisplayName: removedFolderAuthorDisplayNameExpr,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userNamePronunciation: workspaceMembers.namePronunciation,
         userPhone: workspaceMembers.phone,
@@ -640,6 +688,11 @@ export class FolderService {
         })
         .returning()) as Array<{ id: string }>
 
+      const fileCategory = this.resolveAttachmentFileCategory(
+        dto.name,
+        dto.mimeType,
+      )
+
       const [a] = await tx
         .insert(attachments)
         .values({
@@ -653,10 +706,15 @@ export class FolderService {
           type: dto.type,
           name: dto.name,
           size: dto.size,
+          fileCategory,
           mimeType: dto.mimeType ?? null,
           width: dto.width ?? null,
           height: dto.height ?? null,
           duration: dto.duration ?? null,
+          previewImageUrl: null,
+          previewStatus: null,
+          previewUpdatedAt: null,
+          previewErrorCode: null,
           originScope: 'message_body',
         })
         .returning()

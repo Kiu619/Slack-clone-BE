@@ -1,11 +1,20 @@
-import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common'
+import {
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common'
 import type { SQL } from 'drizzle-orm'
 import { and, desc, eq, exists, inArray, or, sql } from 'drizzle-orm'
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres'
 import { DRIZZLE } from '../database/database.module'
 import * as schema from '../database/schema'
 import { attachments, userFileInteractions } from '../database/schema'
+import { LaterService } from '../later/later.service'
+import { CloudinaryService } from '../upload/cloudinary.service'
 import { S3Service } from '../upload/s3.service'
+import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 import type {
   CreateAttachmentDto,
   SearchAttachmentsDto,
@@ -21,12 +30,18 @@ export class AttachmentService {
   constructor(
     @Inject(DRIZZLE) private db: NodePgDatabase<typeof schema>,
     private readonly s3Service: S3Service,
+    private readonly cloudinaryService: CloudinaryService,
+    private readonly laterService: LaterService,
+    private readonly permissionsService: WorkspacePermissionsService,
   ) {}
 
   /**
    * Tạo attachment record sau khi file đã upload lên S3/Cloudinary
    */
   async createAttachment(dto: CreateAttachmentDto, userId: string) {
+    const fileCategory =
+      dto.fileCategory || this.getFileCategory(dto.mimeType, dto.name)
+
     const [attachment] = (await this.db
       .insert(attachments)
       .values({
@@ -35,8 +50,7 @@ export class AttachmentService {
         userId: userId,
         channelId: dto.channelId ?? null,
         conversationId: dto.conversationId ?? null,
-        fileCategory:
-          dto.fileCategory || this.getFileCategory(dto.mimeType, dto.name),
+        fileCategory,
         url: dto.url,
         type: dto.type,
         name: dto.name,
@@ -45,6 +59,10 @@ export class AttachmentService {
         width: dto.width ?? null,
         height: dto.height ?? null,
         duration: dto.duration ?? null,
+        previewImageUrl: null,
+        previewStatus: null,
+        previewUpdatedAt: null,
+        previewErrorCode: null,
         originScope: 'message_body',
       })
       .returning()) as any[]
@@ -195,12 +213,18 @@ export class AttachmentService {
           lastViewedAt: userFileInteractions.lastViewedAt,
         })
         .from(attachments)
-        .innerJoin(schema.messages, eq(attachments.messageId, schema.messages.id))
+        .innerJoin(
+          schema.messages,
+          eq(attachments.messageId, schema.messages.id),
+        )
         .innerJoin(
           schema.workspaceMembers,
           and(
             eq(schema.messages.userId, schema.workspaceMembers.userId),
-            eq(schema.messages.workspaceId, schema.workspaceMembers.workspaceId),
+            eq(
+              schema.messages.workspaceId,
+              schema.workspaceMembers.workspaceId,
+            ),
           ),
         )
         .innerJoin(
@@ -251,6 +275,15 @@ export class AttachmentService {
    * Đánh dấu user vừa xem file
    */
   async trackView(attachmentId: string, userId: string, workspaceId: string) {
+    // Verify workspace membership
+    const membership = await this.permissionsService.getWorkspaceMembership(
+      workspaceId,
+      userId,
+    )
+    if (!membership) {
+      throw new NotFoundException('You are not a member of this workspace')
+    }
+
     await this.db
       .insert(userFileInteractions)
       .values({
@@ -275,8 +308,6 @@ export class AttachmentService {
   private getFileCategory(mimeType?: string | null, name?: string): string {
     const ext = name?.split('.').pop()?.toLowerCase()
 
-    console.log('ext', ext)
-
     // 1. Ưu tiên check theo đuôi file (Extension) - Chính xác nhất cho các loại file phổ biến
     if (ext) {
       if (['xlsx', 'xls', 'csv', 'ods'].includes(ext)) return 'spreadsheet'
@@ -284,14 +315,36 @@ export class AttachmentService {
       if (['pdf'].includes(ext)) return 'pdf'
       if (['doc', 'docx', 'odt', 'rtf', 'txt'].includes(ext)) return 'document'
       if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'archive'
-      if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(ext)) return 'image'
+      if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(ext))
+        return 'image'
       if (['mp4', 'mov', 'wmv', 'avi', 'webm', 'mkv'].includes(ext)) {
         // Nếu là .webm, cần check thêm mimeType vì nó có thể là audio
         if (ext === 'webm' && mimeType?.includes('audio')) return 'audio'
         return 'video'
       }
-      if (['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext)) return 'audio'
-      if (['js', 'ts', 'tsx', 'jsx', 'py', 'java', 'c', 'cpp', 'cs', 'html', 'css', 'json', 'md', 'php', 'sh', 'sql'].includes(ext)) return 'code'
+      if (['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext))
+        return 'audio'
+      if (
+        [
+          'js',
+          'ts',
+          'tsx',
+          'jsx',
+          'py',
+          'java',
+          'c',
+          'cpp',
+          'cs',
+          'html',
+          'css',
+          'json',
+          'md',
+          'php',
+          'sh',
+          'sql',
+        ].includes(ext)
+      )
+        return 'code'
     }
 
     // 2. Fallback check theo mimeType nếu không có extension hoặc extension lạ
@@ -299,7 +352,8 @@ export class AttachmentService {
 
     if (mimeType.startsWith('image/')) return 'image'
     if (mimeType.startsWith('video/')) return 'video'
-    if (mimeType.startsWith('audio/') || mimeType.includes('audio')) return 'audio'
+    if (mimeType.startsWith('audio/') || mimeType.includes('audio'))
+      return 'audio'
     if (mimeType === 'application/pdf' || mimeType.includes('pdf')) return 'pdf'
     if (
       mimeType.includes('spreadsheet') ||
@@ -425,6 +479,8 @@ export class AttachmentService {
       .select({
         id: attachments.id,
         messageId: attachments.messageId,
+        workspaceId: attachments.workspaceId,
+        url: attachments.url,
         userId: schema.messages.userId,
         channelId: schema.messages.channelId,
         conversationId: schema.messages.conversationId,
@@ -435,6 +491,8 @@ export class AttachmentService {
       .limit(1)) as Array<{
       id: string
       messageId: string
+      workspaceId: string
+      url: string
       userId: string
       channelId: string | null
       conversationId: string | null
@@ -448,8 +506,24 @@ export class AttachmentService {
       throw new NotFoundException('Unauthorized')
     }
 
+    await this.deleteAttachmentStorage({
+      id: attachment.id,
+      url: attachment.url,
+    })
+
     // Hard delete (hoặc có thể soft delete nếu cần)
     await this.db.delete(attachments).where(eq(attachments.id, attachmentId))
+
+    try {
+      await this.laterService.purgeAllItemsForAttachment(
+        attachment.workspaceId,
+        attachmentId,
+      )
+    } catch (error) {
+      this.logger.warn(
+        `Attachment deleted but Later purge failed for ${attachmentId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
 
     this.logger.log(`Deleted attachment: ${attachmentId}`)
 
@@ -459,6 +533,56 @@ export class AttachmentService {
       channelId: attachment.channelId,
       conversationId: attachment.conversationId,
       attachmentId,
+    }
+  }
+
+  /**
+   * Xóa blob vật lý theo URL attachment.
+   * Nếu không xác định được storage target thì coi là lỗi để tránh xóa DB trước khi dọn file.
+   */
+  async deleteAttachmentStorage(attachment: {
+    id: string
+    url: string
+    type?: string | null
+  }) {
+    const s3Key = this.s3Service.parseS3KeyFromUrl(attachment.url)
+    if (s3Key) {
+      await this.s3Service.deleteObject(s3Key)
+      return { storage: 's3' as const, key: s3Key }
+    }
+
+    const cloudinaryTarget = this.cloudinaryService.extractDeleteTarget(
+      attachment.url,
+    )
+    if (cloudinaryTarget) {
+      const deleted = await this.cloudinaryService.deleteFile(
+        cloudinaryTarget.publicId,
+        cloudinaryTarget.resourceType,
+      )
+      return {
+        storage: 'cloudinary' as const,
+        publicId: cloudinaryTarget.publicId,
+        resourceType: cloudinaryTarget.resourceType,
+        deleted,
+      }
+    }
+
+    const message = `Cannot resolve storage target for attachment ${attachment.id}`
+    this.logger.error(`${message}: ${attachment.url}`)
+    throw new InternalServerErrorException(
+      'Không thể xóa file vì không xác định được nơi lưu trữ',
+    )
+  }
+
+  async deleteAttachmentStorageBatch(
+    attachmentsToDelete: Array<{
+      id: string
+      url: string
+      type?: string | null
+    }>,
+  ) {
+    for (const attachment of attachmentsToDelete) {
+      await this.deleteAttachmentStorage(attachment)
     }
   }
 }

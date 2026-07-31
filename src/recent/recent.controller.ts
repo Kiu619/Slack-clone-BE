@@ -21,17 +21,20 @@ import { RecentService } from './recent.service'
 export class RecentController {
   constructor(private readonly recentService: RecentService) {}
 
-  @Get(':id/recents')
-  async listRecents(@Req() req: Request, @Param('id') workspaceId: string) {
+  @Get(':workspaceId/recents')
+  async listRecents(
+    @Req() req: Request,
+    @Param('workspaceId') workspaceId: string,
+  ) {
     const { id: userId } = req.user as { id: string }
     return this.recentService.listRecents(workspaceId, userId)
   }
 
-  @Post(':id/recents/visit')
+  @Post(':workspaceId/recents/visit')
   @HttpCode(HttpStatus.OK)
   async recordVisit(
     @Req() req: Request,
-    @Param('id') workspaceId: string,
+    @Param('workspaceId') workspaceId: string,
     @Body(new ZodValidationPipe(RecentVisitSchema)) dto: RecentVisitDto,
     @Headers('x-socket-id') socketId?: string,
   ) {

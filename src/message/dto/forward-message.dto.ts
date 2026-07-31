@@ -12,7 +12,12 @@ const destinationConversationSchema = z.object({
 
 export const ForwardMessageSchema = z.object({
   destinations: z
-    .array(z.discriminatedUnion('type', [destinationChannelSchema, destinationConversationSchema]))
+    .array(
+      z.discriminatedUnion('type', [
+        destinationChannelSchema,
+        destinationConversationSchema,
+      ]),
+    )
     .min(1, 'Select at least one destination')
     .max(50, 'Too many destinations'),
   /** Optional HTML from client editor (same trust model as create message) */

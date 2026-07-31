@@ -1,6 +1,10 @@
 import { Injectable, Inject, forwardRef } from '@nestjs/common'
 import { Server } from 'socket.io'
-import { UnifiedBroadcastService, EntityDomain, EntityAction } from '../chat/unified-broadcast.service'
+import {
+  UnifiedBroadcastService,
+  EntityDomain,
+  EntityAction,
+} from '../chat/unified-broadcast.service'
 
 @Injectable()
 export class UserProfileBroadcastService {
@@ -17,7 +21,7 @@ export class UserProfileBroadcastService {
 
   /**
    * broadcastUserProfileUpdated — gửi thông báo cập nhật profile tới toàn bộ workspace room
-   * 
+   *
    * @param workspaceId - ID của workspace
    * @param data - Dữ liệu update (userId, statusEmoji, statusText, isAway, etc.)
    * @param excludeSocketId - (Tùy chọn) Socket ID để loại trừ khỏi việc broadcast (thường là người gửi)
@@ -45,8 +49,8 @@ export class UserProfileBroadcastService {
       {
         domain: EntityDomain.USER,
         action: EntityAction.UPDATE,
-        payload: { id: data.userId, data, workspaceId }
-      }
+        payload: { id: data.userId, data, workspaceId },
+      },
     )
   }
 }

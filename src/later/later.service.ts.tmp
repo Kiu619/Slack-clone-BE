@@ -1,0 +1,197 @@
+  async getSavedItems(
+    userId: string,
+    workspaceId: string,
+    status?: 'in_progress' | 'completed' | 'archived',
+  ) {
+    const query = this.db
+      .select()
+      .from(savedItems)
+      .where(
+        and(
+          eq(savedItems.userId, userId),
+          eq(savedItems.workspaceId, workspaceId),
+          status ? eq(savedItems.status, status) : undefined,
+        ),
+      )
+      .orderBy(desc(savedItems.createdAt))
+
+    const rows = await query
+
+    // 1. Fetch full message data for saved messages
+    const messageIds = rows
+      .filter((r) => r.type === 'message' && r.messageId)
+      .map((r) => r.messageId) as string[]
+
+    const messagesData =
+      messageIds.length > 0
+        ? await Promise.all(
+            messageIds.map((id) =>
+              this.messageService.getMessageById(id, userId),
+            ),
+          )
+        : []
+
+    // Fetch parent messages for messages that are replies (have parentId)
+    const parentIds = [
+      ...new Set(
+        messagesData
+          .filter((m) => m.parentId)
+          .map((m) => m.parentId as string),
+      ),
+    ]
+
+    const parentMessagesData =
+      parentIds.length > 0
+        ? await Promise.all(
+            parentIds.map((id) =>
+              this.messageService.getMessageById(id, userId).catch(() => null),
+            ),
+          )
+        : []
+
+    const parentMessagesMap = new Map(
+      parentMessagesData.filter(Boolean).map((m) => [m!.id, m!]),
+    )
+
+    // Fetch channel names for messages
+    const messageChannelIds = [
+      ...new Set(
+        messagesData
+          .filter((m) => m.channelId)
+          .map((m) => m.channelId as string),
+      ),
+    ]
+    const messageChannels =
+      messageChannelIds.length > 0
+        ? await this.db
+            .select({ id: channels.id, name: channels.name })
+            .from(channels)
+            .where(inArray(channels.id, messageChannelIds))
+        : []
+    const messageChannelsMap = new Map(
+      messageChannels.map((c) => [c.id, c.name]),
+    )
+
+    // 2. Fetch user profiles for reminders
+    const reminderUserIds = rows
+      .filter((r) => r.type === 'reminder')
+      .map((r) => r.userId)
+
+    const reminderUsers =
+      reminderUserIds.length > 0
+        ? await this.db
+            .select({
+              id: users.id,
+              name: users.name,
+              avatar: users.avatar,
+              wmName: workspaceMembers.name,
+              wmAvatar: workspaceMembers.avatar,
+              displayName: workspaceMembers.displayName,
+            })
+            .from(users)
+            .leftJoin(
+              workspaceMembers,
+              and(
+                eq(workspaceMembers.userId, users.id),
+                eq(workspaceMembers.workspaceId, workspaceId),
+              ),
+            )
+            .where(inArray(users.id, reminderUserIds))
+        : []
+    const reminderUsersMap = new Map(
+      reminderUsers.map((u) => [u.id, u]),
+    )
+
+    // 3. Fetch attachment data separately if needed
+    const attachmentIds = rows
+      .filter((r) => r.type === 'attachment' && r.attachmentId)
+      .map((r) => r.attachmentId) as string[]
+
+    const attachmentsData =
+      attachmentIds.length > 0
+        ? await this.db
+            .select({
+              attachment: attachments,
+              user: {
+                id: users.id,
+                name: users.name,
+                avatar: users.avatar,
+                wmName: workspaceMembers.name,
+                wmAvatar: workspaceMembers.avatar,
+                displayName: workspaceMembers.displayName,
+              },
+              channelName: channels.name,
+            })
+            .from(attachments)
+            .leftJoin(users, eq(attachments.userId, users.id))
+            .leftJoin(
+              workspaceMembers,
+              and(
+                eq(workspaceMembers.userId, attachments.userId),
+                eq(workspaceMembers.workspaceId, workspaceId),
+              ),
+            )
+            .leftJoin(channels, eq(attachments.channelId, channels.id))
+            .where(inArray(attachments.id, attachmentIds))
+        : []
+
+    const messagesMap = new Map(
+      messagesData.map((m) => [
+        m.id,
+        {
+          ...m,
+          parentMessage: m.parentId ? (parentMessagesMap.get(m.parentId) ?? null) : null,
+          channelName: m.channelId ? messageChannelsMap.get(m.channelId) : null,
+        },
+      ]),
+    )
+
+    const attachmentsMap = new Map(
+      attachmentsData.map((a) => [a.attachment.id, a]),
+    )
+
+    // 4. Combine everything
+    return Promise.all(
+      rows.map(async (row) => {
+        const message = row.messageId ? messagesMap.get(row.messageId) : null
+        let attachment: any = null
+
+        if (row.type === 'attachment' && row.attachmentId) {
+          const att = attachmentsMap.get(row.attachmentId)
+          if (att) {
+            attachment = {
+              ...att.attachment,
+              url: await this.getSignedUrl(att.attachment.url, att.attachment.name),
+              user: {
+                id: att.user.id,
+                name: att.user.wmName || att.user.name,
+                displayName: att.user.displayName,
+                avatar: att.user.wmAvatar || att.user.avatar,
+              },
+              channelName: att.channelName,
+            }
+          }
+        }
+
+        let user: any = null
+        if (row.type === 'reminder') {
+          const u = reminderUsersMap.get(row.userId)
+          if (u) {
+            user = {
+              id: u.id,
+              name: u.wmName || u.name,
+              displayName: u.displayName,
+              avatar: u.wmAvatar || u.avatar,
+            }
+          }
+        }
+
+        return {
+          ...row,
+          message,
+          attachment,
+          user,
+        }
+      }),
+    )
+  }

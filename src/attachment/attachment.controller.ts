@@ -53,7 +53,10 @@ export class AttachmentController {
   ) {
     const { id: userId } = req.user as { id: string }
 
-    const attachment = await this.attachmentService.createAttachment(dto, userId)
+    const attachment = await this.attachmentService.createAttachment(
+      dto,
+      userId,
+    )
 
     const message = await this.messageService.getMessageById(
       dto.messageId,
@@ -89,7 +92,7 @@ export class AttachmentController {
 
   @Delete(':id')
   async deleteAttachment(
-    @Param('id') id: string, 
+    @Param('id') id: string,
     @Req() req: Request,
     @Headers('x-socket-id') socketId?: string,
   ) {
@@ -100,7 +103,10 @@ export class AttachmentController {
       ? `channel:${result.channelId}`
       : `conversation:${result.conversationId}`
 
-    const message = await this.messageService.getMessageById(result.messageId, userId)
+    const message = await this.messageService.getMessageById(
+      result.messageId,
+      userId,
+    )
 
     void this.broadcastService.broadcastAttachmentDeleted(
       room,

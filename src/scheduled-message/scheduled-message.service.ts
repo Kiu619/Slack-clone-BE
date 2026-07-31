@@ -93,7 +93,9 @@ export class ScheduledMessageService {
       eq(scheduledMessages.userId, userId),
     )
     const whereExpr =
-      st === 'all' ? baseWhere : and(baseWhere, eq(scheduledMessages.status, st))
+      st === 'all'
+        ? baseWhere
+        : and(baseWhere, eq(scheduledMessages.status, st))
 
     if (st === 'pending') {
       return this.db
@@ -157,7 +159,9 @@ export class ScheduledMessageService {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
       this.logger.error(`Queue add failed: ${msg}`)
-      await this.db.delete(scheduledMessages).where(eq(scheduledMessages.id, id))
+      await this.db
+        .delete(scheduledMessages)
+        .where(eq(scheduledMessages.id, id))
       throw new BadRequestException('Không thể lên lịch hàng đợi')
     }
 
@@ -167,7 +171,7 @@ export class ScheduledMessageService {
       .from(scheduledMessages)
       .where(eq(scheduledMessages.id, id))
       .limit(1)
-    return created!
+    return created
   }
 
   async cancel(
@@ -294,10 +298,7 @@ export class ScheduledMessageService {
         })
         .where(eq(scheduledMessages.id, id))
       const rollbackDelay = Math.min(
-        Math.max(
-          new Date(prevScheduledAt).getTime() - Date.now(),
-          0,
-        ),
+        Math.max(new Date(prevScheduledAt).getTime() - Date.now(), 0),
         BULL_DELAY_MAX,
       )
       try {
@@ -324,7 +325,7 @@ export class ScheduledMessageService {
       .from(scheduledMessages)
       .where(eq(scheduledMessages.id, id))
       .limit(1)
-    return updated!
+    return updated
   }
 
   async dispatch(scheduledMessageId: string) {
@@ -350,11 +351,7 @@ export class ScheduledMessageService {
       ? { channelId: row.channelId }
       : { conversationId: row.conversationId! }
 
-    const message = await this.messageService.createMessage(
-      params,
-      userId,
-      dto,
-    )
+    const message = await this.messageService.createMessage(params, userId, dto)
 
     const room = row.channelId
       ? `channel:${row.channelId}`

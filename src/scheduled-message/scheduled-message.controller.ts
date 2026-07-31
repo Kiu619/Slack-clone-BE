@@ -26,7 +26,9 @@ import { ScheduledMessageService } from './scheduled-message.service'
 @Controller('workspaces/:workspaceId/scheduled-messages')
 @UseGuards(JwtAuthGuard)
 export class ScheduledMessageController {
-  constructor(private readonly scheduledMessageService: ScheduledMessageService) {}
+  constructor(
+    private readonly scheduledMessageService: ScheduledMessageService,
+  ) {}
 
   @Get()
   list(
@@ -36,11 +38,7 @@ export class ScheduledMessageController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.scheduledMessageService.list(
-      workspaceId,
-      userId,
-      query.status,
-    )
+    return this.scheduledMessageService.list(workspaceId, userId, query.status)
   }
 
   @Post()

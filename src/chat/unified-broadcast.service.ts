@@ -6,6 +6,7 @@ export enum EntityDomain {
   USER = 'USER',
   CHANNEL = 'CHANNEL',
   NOTIFICATION = 'NOTIFICATION',
+  EMOJI = 'EMOJI',
 }
 
 export enum EntityAction {
@@ -36,8 +37,14 @@ export class UnifiedBroadcastService {
 
   setServer(server: Server) {
     // DEBUG: log namespace để xác nhận server đúng
-    const nsName = (server as any).name ?? (server as any)._nsps ? '(io server)' : 'unknown'
-    console.log(`[UnifiedBroadcast] setServer called - server namespace info:`, nsName)
+    const nsName =
+      ((server as any).name ?? (server as any)._nsps)
+        ? '(io server)'
+        : 'unknown'
+    console.log(
+      `[UnifiedBroadcast] setServer called - server namespace info:`,
+      nsName,
+    )
     this.server = server
   }
 
@@ -61,12 +68,19 @@ export class UnifiedBroadcastService {
     }
 
     const eventName = 'entity:sync'
-    console.log(`[UnifiedBroadcast] syncEntity emitting '${eventName}' - domain:${syncPayload.domain} action:${syncPayload.action} target:`, JSON.stringify(target))
+    console.log(
+      `[UnifiedBroadcast] syncEntity emitting '${eventName}' - domain:${syncPayload.domain} action:${syncPayload.action} target:`,
+      JSON.stringify(target),
+    )
 
     // 1. Gửi tới Personal Room (Nếu có userId)
     if (target.userId && target.workspaceId) {
-      console.log(`[UnifiedBroadcast]  -> room: user:${target.workspaceId}:${target.userId}`)
-      let emitter = this.server.to(`user:${target.workspaceId}:${target.userId}`)
+      console.log(
+        `[UnifiedBroadcast]  -> room: user:${target.workspaceId}:${target.userId}`,
+      )
+      let emitter = this.server.to(
+        `user:${target.workspaceId}:${target.userId}`,
+      )
       if (excludeSocketId) emitter = emitter.except(excludeSocketId)
       emitter.emit(eventName, syncPayload)
     } else if (target.userId) {
@@ -78,8 +92,10 @@ export class UnifiedBroadcastService {
 
     // 2. Gửi tới Context Room (Nếu có channelId hoặc conversationId)
     if (target.channelId || target.conversationId) {
-      const room = target.channelId ? `channel:${target.channelId}` : `conversation:${target.conversationId}`
-      
+      const room = target.channelId
+        ? `channel:${target.channelId}`
+        : `conversation:${target.conversationId}`
+
       let emitter = this.server.to(room)
       if (excludeSocketId) {
         emitter = emitter.except(excludeSocketId)
@@ -96,8 +112,16 @@ export class UnifiedBroadcastService {
     }
 
     // 3. Gửi tới Workspace Room (Nếu có workspaceId và không có target cụ thể)
-    if (target.workspaceId && !target.userId && !target.channelId && !target.conversationId && !target.threadId) {
-      console.log(`[UnifiedBroadcast]  -> room: workspace:${target.workspaceId}`)
+    if (
+      target.workspaceId &&
+      !target.userId &&
+      !target.channelId &&
+      !target.conversationId &&
+      !target.threadId
+    ) {
+      console.log(
+        `[UnifiedBroadcast]  -> room: workspace:${target.workspaceId}`,
+      )
       let emitter = this.server.to(`workspace:${target.workspaceId}`)
       if (excludeSocketId) emitter = emitter.except(excludeSocketId)
       emitter.emit(eventName, syncPayload)
@@ -127,7 +151,12 @@ export class UnifiedBroadcastService {
   /**
    * broadcastToChannel — Gửi sự kiện tới cả channel (Dùng cho Tin nhắn mới, Typing...)
    */
-  broadcastToChannel(channelId: string, event: string, data: any, excludeSocketId?: string) {
+  broadcastToChannel(
+    channelId: string,
+    event: string,
+    data: any,
+    excludeSocketId?: string,
+  ) {
     if (!this.server) return
     const room = `channel:${channelId}`
     if (excludeSocketId) {

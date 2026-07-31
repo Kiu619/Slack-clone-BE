@@ -1,12 +1,21 @@
-import { Body, Controller, Post, UseGuards, UsePipes } from '@nestjs/common'
+import { Idempotent } from '@/auth/decorators/idempotent.decorator'
+import { JwtAuthGuard } from '@/auth/guards/jwt-auth.guard'
+import { IdempotencyInterceptor } from '@/common/interceptors/idempotency.interceptor'
+import { ZodValidationPipe } from '@/common/pipes/zod-validation.pipe'
+import {
+  Body,
+  Controller,
+  Post,
+  UseGuards,
+  UseInterceptors,
+  UsePipes,
+} from '@nestjs/common'
 import { CloudinaryService } from './cloudinary.service'
 import {
   type PresignedUrlRequestDto,
   PresignedUrlRequestSchema,
 } from './dto/presigned-url.dto'
 import { S3Service } from './s3.service'
-import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard'
-import { ZodValidationPipe } from 'src/common/pipes/zod-validation.pipe'
 
 /**
  * UploadController — Endpoints để generate presigned URLs
@@ -16,6 +25,7 @@ import { ZodValidationPipe } from 'src/common/pipes/zod-validation.pipe'
  */
 @Controller('upload')
 @UseGuards(JwtAuthGuard)
+@UseInterceptors(IdempotencyInterceptor)
 export class UploadController {
   constructor(
     private s3Service: S3Service,
@@ -28,6 +38,7 @@ export class UploadController {
    */
   @Post('presigned-url/s3')
   @UsePipes(new ZodValidationPipe(PresignedUrlRequestSchema))
+  @Idempotent(300)
   async getS3PresignedUrl(@Body() dto: PresignedUrlRequestDto) {
     const { url, key, expiresIn } = await this.s3Service.generatePresignedUrl(
       dto.fileName,
@@ -50,12 +61,13 @@ export class UploadController {
    */
   @Post('presigned-url/cloudinary')
   @UsePipes(new ZodValidationPipe(PresignedUrlRequestSchema))
+  @Idempotent(300)
   getCloudinarySignature(@Body() dto: PresignedUrlRequestDto) {
     const { signature, timestamp, cloudName, apiKey, folder, publicId } =
       this.cloudinaryService.generateUploadSignature(
         dto.fileName,
         dto.fileType,
-        dto.fileSize
+        dto.fileSize,
       )
 
     return {

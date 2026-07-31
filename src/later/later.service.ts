@@ -1,4 +1,9 @@
-import { Inject, Injectable, NotFoundException, forwardRef } from '@nestjs/common'
+import {
+  Inject,
+  Injectable,
+  NotFoundException,
+  forwardRef,
+} from '@nestjs/common'
 import { randomUUID } from 'crypto'
 import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
@@ -24,7 +29,7 @@ export class LaterService {
     @Inject(forwardRef(() => MessageService))
     private readonly messageService: MessageService,
     private readonly broadcastService: ChatBroadcastService,
-  ) { }
+  ) {}
 
   /**
    * Chuyển S3 URL thành presigned URL (signed URL)
@@ -47,7 +52,10 @@ export class LaterService {
     userId: string,
     workspaceId: string,
     messageIds: string[],
-  ): Promise<{ savedMessageIds: string[]; remindAtByMessageId: Record<string, string> }> {
+  ): Promise<{
+    savedMessageIds: string[]
+    remindAtByMessageId: Record<string, string>
+  }> {
     if (messageIds.length === 0) {
       return { savedMessageIds: [], remindAtByMessageId: {} }
     }
@@ -145,11 +153,111 @@ export class LaterService {
         ),
       )
 
-    const ids = [...new Set([...directRows.map((r) => r.id), ...attachmentRows.map((r) => r.id)])]
+    const ids = [
+      ...new Set([
+        ...directRows.map((r) => r.id),
+        ...attachmentRows.map((r) => r.id),
+      ]),
+    ]
     for (const itemId of ids) {
       await this.removeItem(userId, itemId)
     }
     return { success: true, removed: ids.length }
+  }
+
+  async purgeAllItemsForMessage(
+    workspaceId: string,
+    messageId: string,
+  ): Promise<{ success: true; removed: number }> {
+    const directRows = await this.db
+      .select({ id: savedItems.id })
+      .from(savedItems)
+      .where(
+        and(
+          eq(savedItems.workspaceId, workspaceId),
+          eq(savedItems.type, 'message'),
+          eq(savedItems.messageId, messageId),
+        ),
+      )
+
+    const attachmentRows = await this.db
+      .select({ id: savedItems.id })
+      .from(savedItems)
+      .innerJoin(attachments, eq(savedItems.attachmentId, attachments.id))
+      .where(
+        and(
+          eq(savedItems.workspaceId, workspaceId),
+          eq(savedItems.type, 'attachment'),
+          eq(attachments.messageId, messageId),
+        ),
+      )
+
+    const ids = [
+      ...new Set([
+        ...directRows.map((r) => r.id),
+        ...attachmentRows.map((r) => r.id),
+      ]),
+    ]
+    if (ids.length === 0) {
+      return { success: true, removed: 0 }
+    }
+
+    const deletedRows = await this.db
+      .delete(savedItems)
+      .where(inArray(savedItems.id, ids))
+      .returning({
+        id: savedItems.id,
+        userId: savedItems.userId,
+        workspaceId: savedItems.workspaceId,
+      })
+
+    for (const row of deletedRows) {
+      this.broadcastService.broadcastToUser(
+        row.userId,
+        row.workspaceId,
+        'later:removed',
+        {
+          itemId: row.id,
+          workspaceId: row.workspaceId,
+        },
+      )
+    }
+
+    return { success: true, removed: deletedRows.length }
+  }
+
+  async purgeAllItemsForAttachment(
+    workspaceId: string,
+    attachmentId: string,
+  ): Promise<{ success: true; removed: number }> {
+    const deletedRows = await this.db
+      .delete(savedItems)
+      .where(
+        and(
+          eq(savedItems.workspaceId, workspaceId),
+          eq(savedItems.type, 'attachment'),
+          eq(savedItems.attachmentId, attachmentId),
+        ),
+      )
+      .returning({
+        id: savedItems.id,
+        userId: savedItems.userId,
+        workspaceId: savedItems.workspaceId,
+      })
+
+    for (const row of deletedRows) {
+      this.broadcastService.broadcastToUser(
+        row.userId,
+        row.workspaceId,
+        'later:removed',
+        {
+          itemId: row.id,
+          workspaceId: row.workspaceId,
+        },
+      )
+    }
+
+    return { success: true, removed: deletedRows.length }
   }
 
   async saveItem(userId: string, workspaceId: string, dto: SaveItemDto) {
@@ -227,11 +335,17 @@ export class LaterService {
       .where(and(eq(savedItems.id, itemId), eq(savedItems.userId, userId)))
       .returning()
 
-    if (!deleted) throw new NotFoundException('Item not found in your Later list')
-    this.broadcastService.broadcastToUser(userId, deleted.workspaceId, 'later:removed', {
-      itemId,
-      workspaceId: deleted.workspaceId,
-    })
+    if (!deleted)
+      throw new NotFoundException('Item not found in your Later list')
+    this.broadcastService.broadcastToUser(
+      userId,
+      deleted.workspaceId,
+      'later:removed',
+      {
+        itemId,
+        workspaceId: deleted.workspaceId,
+      },
+    )
     return { success: true }
   }
 
@@ -246,7 +360,12 @@ export class LaterService {
         ),
       )
 
-    this.broadcastService.broadcastToUser(userId, workspaceId, 'later:cleared_completed', { workspaceId })
+    this.broadcastService.broadcastToUser(
+      userId,
+      workspaceId,
+      'later:cleared_completed',
+      { workspaceId },
+    )
     return { success: true }
   }
 
@@ -272,8 +391,43 @@ export class LaterService {
       .returning()
 
     if (!updated) throw new NotFoundException('Item not found')
-    this.broadcastService.broadcastToUser(userId, updated.workspaceId, 'later:updated', updated)
+    this.broadcastService.broadcastToUser(
+      userId,
+      updated.workspaceId,
+      'later:updated',
+      updated,
+    )
     return updated
+  }
+
+  async getLaterSummary(userId: string, workspaceId: string) {
+    const baseWhereClause = and(
+      eq(savedItems.userId, userId),
+      eq(savedItems.workspaceId, workspaceId),
+      eq(savedItems.status, 'in_progress'),
+      sql`${savedItems.remindAt} IS NOT NULL`,
+    )
+
+    const [{ overdueCount }] = await this.db
+      .select({
+        overdueCount: sql<number>`COUNT(*)`,
+      })
+      .from(savedItems)
+      .where(and(baseWhereClause, sql`${savedItems.remindAt} <= NOW()`))
+
+    const [nextOverdueRow] = await this.db
+      .select({
+        nextOverdueAt: sql<Date | null>`MIN(${savedItems.remindAt})`,
+      })
+      .from(savedItems)
+      .where(and(baseWhereClause, sql`${savedItems.remindAt} > NOW()`))
+
+    return {
+      overdueCount: Number(overdueCount ?? 0),
+      nextOverdueAt: nextOverdueRow?.nextOverdueAt
+        ? new Date(nextOverdueRow.nextOverdueAt).toISOString()
+        : null,
+    }
   }
 
   async getSavedItems(
@@ -290,18 +444,27 @@ export class LaterService {
           ELSE 3
         END`
 
-    let whereClause = and(
+    let baseWhereClause = and(
       eq(savedItems.userId, userId),
       eq(savedItems.workspaceId, workspaceId),
       status ? eq(savedItems.status, status) : undefined,
     )
 
     if (hideUpcoming && status === 'in_progress') {
-      whereClause = and(
-        whereClause,
+      baseWhereClause = and(
+        baseWhereClause,
         sql`(${savedItems.remindAt} IS NULL OR ${savedItems.remindAt} <= NOW())`,
       )
     }
+
+    const [{ totalCount }] = await this.db
+      .select({
+        totalCount: sql<number>`COUNT(*)`,
+      })
+      .from(savedItems)
+      .where(baseWhereClause)
+
+    let whereClause = baseWhereClause
 
     if (cursor) {
       const [pStr, tsStr] = cursor.split(':')
@@ -318,17 +481,14 @@ export class LaterService {
       .select()
       .from(savedItems)
       .where(whereClause)
-      .orderBy(
-        sql`${prioritySql} ASC`,
-        desc(savedItems.createdAt)
-      )
+      .orderBy(sql`${prioritySql} ASC`, desc(savedItems.createdAt))
       .limit(limit)
 
     const rows = await query
 
     // 1. Collect all message IDs from both saved messages and attachments
     const messageIds = new Set<string>()
-    rows.forEach(r => {
+    rows.forEach((r) => {
       if ((r.type === 'message' || r.type === 'attachment') && r.messageId) {
         messageIds.add(r.messageId)
       }
@@ -348,6 +508,7 @@ export class LaterService {
                 id: users.id,
                 name: users.name,
                 avatar: users.avatar,
+                wmId: workspaceMembers.id,
                 wmName: workspaceMembers.name,
                 wmAvatar: workspaceMembers.avatar,
                 displayName: workspaceMembers.displayName,
@@ -368,7 +529,7 @@ export class LaterService {
         : []
 
     // Add messageIds from attachment records (in case row.messageId was null)
-    attachmentsData.forEach(a => {
+    attachmentsData.forEach((a) => {
       if (a.attachment.messageId) {
         messageIds.add(a.attachment.messageId)
       }
@@ -376,9 +537,10 @@ export class LaterService {
 
     // 3. Fetch all messages in one go (including those for attachments)
     const messageIdsArray = Array.from(messageIds)
-    const messagesMapRaw = messageIdsArray.length > 0
-      ? await this.messageService.getMessagesByIds(messageIdsArray, userId)
-      : new Map<string, any>()
+    const messagesMapRaw =
+      messageIdsArray.length > 0
+        ? await this.messageService.getMessagesByIds(messageIdsArray, userId)
+        : new Map<string, any>()
 
     const messagesData = Array.from(messagesMapRaw.values())
 
@@ -391,17 +553,19 @@ export class LaterService {
       ),
     ]
 
-    const parentMessagesMapRaw = parentIds.length > 0
-      ? await this.messageService.getMessagesByIds(parentIds, userId)
-      : new Map<string, any>()
-
+    const parentMessagesMapRaw =
+      parentIds.length > 0
+        ? await this.messageService.getMessagesByIds(parentIds, userId)
+        : new Map<string, any>()
 
     const messagesMap = new Map(
       messagesData.map((m) => {
-        const parentMessage = m.parentId 
-          ? (messagesMapRaw.get(m.parentId) || parentMessagesMapRaw.get(m.parentId) || null)
-          : null;
-        
+        const parentMessage = m.parentId
+          ? messagesMapRaw.get(m.parentId) ||
+            parentMessagesMapRaw.get(m.parentId) ||
+            null
+          : null
+
         return [
           m.id,
           {
@@ -425,6 +589,7 @@ export class LaterService {
               id: users.id,
               name: users.name,
               avatar: users.avatar,
+              wmId: workspaceMembers.id,
               wmName: workspaceMembers.name,
               wmAvatar: workspaceMembers.avatar,
               displayName: workspaceMembers.displayName,
@@ -439,10 +604,7 @@ export class LaterService {
             )
             .where(inArray(users.id, reminderUserIds))
         : []
-    const reminderUsersMap = new Map(
-      reminderUsers.map((u) => [u.id, u]),
-    )
-
+    const reminderUsersMap = new Map(reminderUsers.map((u) => [u.id, u]))
 
     const attachmentsMap = new Map(
       attachmentsData.map((a) => [a.attachment.id, a]),
@@ -457,15 +619,29 @@ export class LaterService {
         if (row.type === 'attachment' && row.attachmentId) {
           const att = attachmentsMap.get(row.attachmentId)
           if (att) {
-            const associatedMessage = att.attachment.messageId ? messagesMap.get(att.attachment.messageId) : null;
+            const associatedMessage = att.attachment.messageId
+              ? messagesMap.get(att.attachment.messageId)
+              : null
             attachment = {
               ...att.attachment,
-              url: await this.getSignedUrl(att.attachment.url, att.attachment.name),
+              url: await this.getSignedUrl(
+                att.attachment.url,
+                att.attachment.name,
+              ),
               user: {
                 id: att.user.id,
-                name: att.user.wmName || att.user.name,
-                displayName: att.user.displayName,
-                avatar: att.user.wmAvatar || att.user.avatar,
+                name:
+                  att.user.wmId == null
+                    ? 'deactivated user'
+                    : att.user.wmName || att.user.name,
+                displayName:
+                  att.user.wmId == null
+                    ? 'deactivated user'
+                    : att.user.displayName,
+                avatar:
+                  att.user.wmId == null
+                    ? null
+                    : att.user.wmAvatar || att.user.avatar,
               },
               channelName: att.channelName,
               parentId: associatedMessage?.parentId || null,
@@ -480,9 +656,9 @@ export class LaterService {
           if (u) {
             user = {
               id: u.id,
-              name: u.wmName || u.name,
-              displayName: u.displayName,
-              avatar: u.wmAvatar || u.avatar,
+              name: u.wmId == null ? 'deactivated user' : u.wmName || u.name,
+              displayName: u.wmId == null ? 'deactivated user' : u.displayName,
+              avatar: u.wmId == null ? null : u.wmAvatar || u.avatar,
             }
           }
         }
@@ -510,6 +686,7 @@ export class LaterService {
     return {
       items,
       nextCursor,
+      totalCount: Number(totalCount ?? 0),
     }
   }
 }

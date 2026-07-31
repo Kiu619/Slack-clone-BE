@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-redundant-type-constituents */
 import {
   BadRequestException,
   ForbiddenException,
@@ -5,11 +6,29 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  forwardRef,
 } from '@nestjs/common'
 import { randomUUID } from 'crypto'
-import { and, asc, desc, eq, gt, ilike, inArray, isNull, lt, ne, or, sql } from 'drizzle-orm'
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  ilike,
+  inArray,
+  isNull,
+  lt,
+  ne,
+  or,
+  sql,
+} from 'drizzle-orm'
+import { supportsOfficeThumbnail } from '../attachment-preview/office-preview.utils'
+import {
+  OfficeThumbnailError,
+  OfficeThumbnailGeneratorService,
+} from '../attachment-preview/office-thumbnail-generator.service'
 import { AttachmentService } from '../attachment/attachment.service'
-import { NotificationService } from '../notification/notification.service'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
   attachments,
@@ -19,18 +38,22 @@ import {
   directMessageConversations,
   messages,
   reactions,
+  threadSubscriptions,
   users,
   workspaceMembers,
-  threadSubscriptions,
 } from '../database/schema'
+import { LaterService } from '../later/later.service'
+import { NotificationService } from '../notification/notification.service'
 import { RedisService } from '../redis/redis.service'
 import { S3Service } from '../upload/s3.service'
+import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 import type {
   AddReactionDto,
   CreateMessageDto,
   UpdateMessageDto,
 } from './dto/create-message.dto'
 import type { ForwardMessageDto } from './dto/forward-message.dto'
+import type { SearchWorkspaceMessagesDto } from './dto/search-workspace-messages.dto'
 
 const PAGE_SIZE = 20
 
@@ -44,14 +67,26 @@ const CHANNEL_FILES_PAGE_SIZE = 30
  */
 const MESSAGE_CACHE_TTL = 30
 
+const removedAuthorNameExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`
+const removedAuthorDisplayNameExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`
+const removedAuthorAvatarExpr = sql<
+  string | null
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN NULL ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar}) END`
+
 type MessageJoinRow = {
   id: string
   workspaceId: string
   channelId: string | null
   conversationId: string | null
   content: string
-  type: 'text' | 'system' | 'timeline'
+  type: 'text' | 'system' | 'timeline' | 'huddle'
   parentId: string | null
+  huddleSessionId?: string | null
+  huddleSnapshot?: unknown | null
   alsoSendToChannel: boolean
   replyCount: number
   replyParticipantIds: string[]
@@ -97,8 +132,10 @@ type ChannelFileJoinRow = {
   channelId: string | null
   conversationId: string | null
   content: string
-  type: 'text' | 'system' | 'timeline'
+  type: 'text' | 'system' | 'timeline' | 'huddle'
   parentId: string | null
+  huddleSessionId?: string | null
+  huddleSnapshot?: unknown | null
   alsoSendToChannel: boolean
   replyCount: number
   replyParticipantIds: string[]
@@ -123,6 +160,38 @@ type ChannelFileJoinRow = {
   userStatusEmoji: string | null
 }
 
+type ReactionUserSnapshot = {
+  id: string
+  name: string | null
+  displayName: string | null
+  avatar: string | null
+}
+
+type ReactionSnapshotRow = {
+  messageId: string
+  emoji: string
+  userId: string
+  userName: string | null
+  userDisplayName: string | null
+  userAvatar: string | null
+}
+
+type ReactionSnapshot = {
+  emoji: string
+  count: number
+  userIds: string[]
+  users: ReactionUserSnapshot[]
+}
+
+type WorkspaceMessageSearchRow = MessageJoinRow & {
+  rank: number | null
+  excerpt: string
+  channelName: string | null
+  channelIsPrivate: boolean | null
+  conversationIsGroup: boolean | null
+  conversationLabel: string | null
+}
+
 @Injectable()
 export class MessageService {
   private readonly logger = new Logger(MessageService.name)
@@ -131,9 +200,13 @@ export class MessageService {
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly redis: RedisService,
     private readonly attachmentService: AttachmentService,
+    private readonly officeThumbnailGenerator: OfficeThumbnailGeneratorService,
     private readonly s3Service: S3Service,
     private readonly notificationService: NotificationService,
-  ) { }
+    private readonly permissionsService: WorkspacePermissionsService,
+    @Inject(forwardRef(() => LaterService))
+    private readonly laterService: LaterService,
+  ) {}
 
   /**
    * Chuyển S3 URL thành presigned GET URL (bucket private → cần signed URL để truy cập).
@@ -207,7 +280,10 @@ export class MessageService {
     if (t.includes('Đang tải file') || t.includes('Tải file thất bại')) {
       return false
     }
-    const plain = t.replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').trim()
+    const plain = t
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .trim()
     return plain.length > 0
   }
 
@@ -242,7 +318,6 @@ export class MessageService {
     }
   }
 
-
   /**
    * messageCacheKey — tạo Redis key cho cache messages
    * Chỉ cache page đầu (không có cursor) vì đây là trang hay được fetch nhất
@@ -252,7 +327,127 @@ export class MessageService {
     return `messages:v2:${targetId}:page1`
   }
 
+  private resolveAttachmentFileCategory(
+    name: string,
+    mimeType?: string | null,
+    fileCategory?: string | null,
+  ) {
+    if (fileCategory) return fileCategory
+
+    const ext = name.split('.').pop()?.toLowerCase()
+    if (ext) {
+      if (['xlsx', 'xls', 'csv', 'ods'].includes(ext)) return 'spreadsheet'
+      if (['pptx', 'ppt', 'odp'].includes(ext)) return 'presentation'
+      if (['doc', 'docx', 'odt', 'rtf', 'txt'].includes(ext)) return 'document'
+    }
+
+    if (!mimeType) return 'other'
+    if (
+      mimeType.includes('spreadsheet') ||
+      mimeType.includes('excel') ||
+      mimeType.includes('sheet') ||
+      mimeType.includes('csv')
+    ) {
+      return 'spreadsheet'
+    }
+    if (
+      mimeType.includes('presentation') ||
+      mimeType.includes('powerpoint') ||
+      mimeType.includes('officedocument.presentationml')
+    ) {
+      return 'presentation'
+    }
+    if (
+      mimeType.includes('word') ||
+      mimeType.includes('officedocument.wordprocessingml') ||
+      mimeType === 'application/msword' ||
+      mimeType.includes('document') ||
+      mimeType.includes('wordprocessingml')
+    ) {
+      return 'document'
+    }
+
+    return 'other'
+  }
+
   /** Xóa cache Redis trang 1 tin (channel hoặc DM) — dùng sau merge / bulk update. */
+  private async buildAttachmentInsertValue(
+    attachment: {
+      url: string
+      type: string
+      name: string
+      size: number
+      mimeType?: string | null
+      width?: number | null
+      height?: number | null
+      duration?: number | null
+      fileCategory?: string | null
+    },
+    context: {
+      messageId: string
+      workspaceId: string
+      userId: string
+      channelId: string | null
+      conversationId: string | null
+      originScope: string
+    },
+  ) {
+    const fileCategory = this.resolveAttachmentFileCategory(
+      attachment.name,
+      attachment.mimeType,
+      attachment.fileCategory,
+    )
+    const attachmentId = randomUUID()
+    let previewImageUrl: string | null = null
+    let previewStatus: 'ready' | 'failed' | null = null
+    let previewUpdatedAt: Date | null = null
+    let previewErrorCode: string | null = null
+
+    if (supportsOfficeThumbnail(fileCategory)) {
+      try {
+        const preview = await this.officeThumbnailGenerator.generateThumbnail({
+          id: attachmentId,
+          workspaceId: context.workspaceId,
+          name: attachment.name,
+          url: attachment.url,
+        })
+        previewImageUrl = preview.previewImageUrl
+        previewStatus = 'ready'
+        previewUpdatedAt = new Date()
+      } catch (error) {
+        const previewError =
+          error instanceof OfficeThumbnailError
+            ? error
+            : new OfficeThumbnailError(
+                'unknown_preview_error',
+                'Unknown Office preview generation error.',
+              )
+        this.logger.warn(
+          `Office preview sync failed for ${attachment.name}: ${previewError.code}`,
+        )
+        previewStatus = 'failed'
+        previewUpdatedAt = new Date()
+        previewErrorCode = previewError.code
+      }
+    }
+
+    return {
+      id: attachmentId,
+      messageId: context.messageId,
+      workspaceId: context.workspaceId,
+      userId: context.userId,
+      channelId: context.channelId,
+      conversationId: context.conversationId,
+      ...attachment,
+      fileCategory,
+      previewImageUrl,
+      previewStatus,
+      previewUpdatedAt,
+      previewErrorCode,
+      originScope: context.originScope,
+    }
+  }
+
   async invalidateMessagePage1Caches(conversationOrChannelIds: string[]) {
     const ids = [...new Set(conversationOrChannelIds.filter(Boolean))]
     if (ids.length === 0) return
@@ -267,6 +462,8 @@ export class MessageService {
       content: messages.content,
       type: messages.type,
       parentId: messages.parentId,
+      huddleSessionId: messages.huddleSessionId,
+      huddleSnapshot: messages.huddleSnapshot,
       alsoSendToChannel: messages.alsoSendToChannel,
       replyCount: messages.replyCount,
       replyParticipantIds: sql<string[]>`
@@ -288,15 +485,9 @@ export class MessageService {
       allowEdit: messages.allowEdit,
       userId: users.id,
       userEmail: users.email,
-      userName: sql<
-        string | null
-      >`COALESCE(${workspaceMembers.name}, ${users.name})`,
-      userAvatar: sql<
-        string | null
-      >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-      userDisplayName: sql<
-        string | null
-      >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+      userName: removedAuthorNameExpr,
+      userAvatar: removedAuthorAvatarExpr,
+      userDisplayName: removedAuthorDisplayNameExpr,
       userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
       userStatus: workspaceMembers.statusText,
       userStatusEmoji: workspaceMembers.statusEmoji,
@@ -317,31 +508,38 @@ export class MessageService {
     const allRelevantIds = Array.from(new Set([...messageIds, ...parentIds]))
 
     const [reactionRows, attachmentsMap] = await Promise.all([
-      messageIds.length > 0
-        ? (this.db
-          .select({
-            messageId: reactions.messageId,
-            emoji: reactions.emoji,
-            userId: reactions.userId,
-          })
-          .from(reactions)
-          .where(inArray(reactions.messageId, messageIds)) as Promise<
-            Array<{ messageId: string; emoji: string; userId: string }>
-          >)
-        : Promise.resolve([]),
+      this.fetchReactionSnapshotRows(messageIds),
       this.attachmentService.getAttachmentsByMessageIds(allRelevantIds),
     ])
 
     const reactionsByMessage = reactionRows.reduce<
-      Record<string, { emoji: string; count: number; userIds: string[] }[]>
+      Record<string, ReactionSnapshot[]>
     >((acc, r) => {
       if (!acc[r.messageId]) acc[r.messageId] = []
       const existing = acc[r.messageId].find((x) => x.emoji === r.emoji)
       if (existing) {
         existing.count++
         existing.userIds.push(r.userId)
+        existing.users.push({
+          id: r.userId,
+          name: r.userName,
+          displayName: r.userDisplayName,
+          avatar: r.userAvatar,
+        })
       } else {
-        acc[r.messageId].push({ emoji: r.emoji, count: 1, userIds: [r.userId] })
+        acc[r.messageId].push({
+          emoji: r.emoji,
+          count: 1,
+          userIds: [r.userId],
+          users: [
+            {
+              id: r.userId,
+              name: r.userName,
+              displayName: r.userDisplayName,
+              avatar: r.userAvatar,
+            },
+          ],
+        })
       }
       return acc
     }, {})
@@ -349,12 +547,36 @@ export class MessageService {
     return { reactionsByMessage, attachmentsMap }
   }
 
+  private async fetchReactionSnapshotRows(
+    messageIds: string[],
+  ): Promise<ReactionSnapshotRow[]> {
+    if (messageIds.length === 0) return []
+
+    return (await this.db
+      .select({
+        messageId: reactions.messageId,
+        emoji: reactions.emoji,
+        userId: reactions.userId,
+        userName: removedAuthorNameExpr,
+        userDisplayName: removedAuthorDisplayNameExpr,
+        userAvatar: removedAuthorAvatarExpr,
+      })
+      .from(reactions)
+      .innerJoin(messages, eq(reactions.messageId, messages.id))
+      .innerJoin(users, eq(reactions.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, reactions.userId),
+          eq(workspaceMembers.workspaceId, messages.workspaceId),
+        ),
+      )
+      .where(inArray(reactions.messageId, messageIds))) as ReactionSnapshotRow[]
+  }
+
   private async formatMessageRow(
     row: MessageJoinRow,
-    reactionsByMessage: Record<
-      string,
-      { emoji: string; count: number; userIds: string[] }[]
-    >,
+    reactionsByMessage: Record<string, ReactionSnapshot[]>,
     attachmentsMap: Map<string, any[]>,
   ) {
     const atts = attachmentsMap.get(row.id) ?? []
@@ -369,6 +591,11 @@ export class MessageService {
       content: row.deletedAt ? '' : row.content,
       type: row.type,
       parentId: row.parentId,
+      huddleSessionId: row.huddleSessionId ?? null,
+      huddleSnapshot:
+        row.huddleSnapshot != null
+          ? (row.huddleSnapshot as Record<string, unknown>)
+          : null,
       alsoSendToChannel: row.alsoSendToChannel,
       replyCount: row.replyCount,
       replyParticipantIds: row.replyParticipantIds,
@@ -400,14 +627,14 @@ export class MessageService {
       parent:
         row.parentId && row.alsoSendToChannel
           ? {
-            content: row.parentDeletedAt ? '' : (row.parentContent ?? ''),
-            deletedAt: row.parentDeletedAt?.toISOString() ?? null,
-            attachments: await Promise.all(
-              (attachmentsMap.get(row.parentId) ?? []).map((a) =>
-                this.enrichAttachmentWithSignedUrl(a),
+              content: row.parentDeletedAt ? '' : (row.parentContent ?? ''),
+              deletedAt: row.parentDeletedAt?.toISOString() ?? null,
+              attachments: await Promise.all(
+                (attachmentsMap.get(row.parentId) ?? []).map((a) =>
+                  this.enrichAttachmentWithSignedUrl(a),
+                ),
               ),
-            ),
-          }
+            }
           : undefined,
       ...(row.forwardSnapshot != null
         ? { forwardSnapshot: row.forwardSnapshot as Record<string, unknown> }
@@ -424,6 +651,7 @@ export class MessageService {
         id: directMessageConversations.id,
         workspaceId: directMessageConversations.workspaceId,
         memberId: conversationMembers.id,
+        membershipStatus: workspaceMembers.membershipStatus,
       })
       .from(directMessageConversations)
       .innerJoin(
@@ -433,15 +661,51 @@ export class MessageService {
           eq(conversationMembers.userId, userId),
         ),
       )
+      .innerJoin(
+        workspaceMembers,
+        and(
+          eq(
+            workspaceMembers.workspaceId,
+            directMessageConversations.workspaceId,
+          ),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
       .where(eq(directMessageConversations.id, conversationId))
       .limit(1)
 
     if (!row)
       throw new NotFoundException('Conversation not found or access denied')
+    if (row.membershipStatus !== 'active') {
+      throw new ForbiddenException('Your workspace membership is deactivated')
+    }
 
     return {
       id: row.id,
       workspaceId: row.workspaceId,
+    }
+  }
+
+  private async assertWorkspaceAccess(workspaceId: string, userId: string) {
+    const [row] = await this.db
+      .select({
+        id: workspaceMembers.id,
+        membershipStatus: workspaceMembers.membershipStatus,
+      })
+      .from(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    if (!row) {
+      throw new ForbiddenException('Not a workspace member')
+    }
+    if (row.membershipStatus !== 'active') {
+      throw new ForbiddenException('Your workspace membership is deactivated')
     }
   }
 
@@ -452,6 +716,7 @@ export class MessageService {
         workspaceId: channels.workspaceId,
         isPrivate: channels.isPrivate,
         wsMemberId: workspaceMembers.id,
+        wsMembershipStatus: workspaceMembers.membershipStatus,
         chMemberId: channelMembers.id,
       })
       .from(channels)
@@ -474,12 +739,63 @@ export class MessageService {
 
     if (!row) throw new NotFoundException('Channel not found')
     if (!row.wsMemberId) throw new ForbiddenException('Not a workspace member')
-    if (!row.chMemberId && row.isPrivate) throw new ForbiddenException('Not a channel member')
+    if (row.wsMembershipStatus !== 'active') {
+      throw new ForbiddenException('Your workspace membership is deactivated')
+    }
+    if (!row.chMemberId && row.isPrivate)
+      throw new ForbiddenException('Not a channel member')
 
     return {
       id: row.id,
       workspaceId: row.workspaceId,
       isPrivate: row.isPrivate,
+    }
+  }
+
+  private async getChannelPostingPermission(channelId: string, userId: string) {
+    const [row] = await this.db
+      .select({
+        channelId: channels.id,
+        workspaceId: channels.workspaceId,
+        postingSettings: channels.postingSettings,
+      })
+      .from(channels)
+      .innerJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, channels.workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
+      .where(eq(channels.id, channelId))
+      .limit(1)
+
+    if (!row) {
+      throw new NotFoundException('Channel not found or access denied')
+    }
+
+    const settings = row.postingSettings
+    const isAdmin = await this.permissionsService.canUser(
+      row.workspaceId,
+      userId,
+      'manage_user_permissions',
+    )
+    const canPost =
+      !settings ||
+      settings.mode === 'everyone' ||
+      (settings.mode === 'admin_only'
+        ? isAdmin
+        : isAdmin || settings.specificUserIds.includes(userId))
+
+    const canReply = !settings || settings.allowThreads ? true : canPost
+    const canSendToChannel = canPost
+    const canMentionChannelWide = !settings || settings.allowMentions
+
+    return {
+      canPost,
+      canReply,
+      canSendToChannel,
+      canMentionChannelWide,
     }
   }
 
@@ -516,35 +832,42 @@ export class MessageService {
     if (cursor) {
       const parts = cursor.split('|')
       cursorDate = new Date(parts[0])
-      cursorId = parts.length > 1 ? parts[1] : undefined; if (cursorDate && isNaN(cursorDate.getTime())) cursorDate = undefined
+      cursorId = parts.length > 1 ? parts[1] : undefined
+      if (cursorDate && isNaN(cursorDate.getTime())) cursorDate = undefined
     }
 
     const whereConditions = cursorDate
       ? and(
-        channelId
-          ? eq(messages.channelId, channelId)
-          : eq(messages.conversationId, conversationId!),
-        direction === 'forward'
-          ? cursorId
-            ? or(
-              gt(messages.createdAt, cursorDate),
-              and(eq(messages.createdAt, cursorDate), gt(messages.id, cursorId))
-            )
-            : gt(messages.createdAt, cursorDate)
-          : cursorId
-            ? or(
-              lt(messages.createdAt, cursorDate),
-              and(eq(messages.createdAt, cursorDate), lt(messages.id, cursorId))
-            )
-            : lt(messages.createdAt, cursorDate),
-        or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
-      )
+          channelId
+            ? eq(messages.channelId, channelId)
+            : eq(messages.conversationId, conversationId!),
+          direction === 'forward'
+            ? cursorId
+              ? or(
+                  gt(messages.createdAt, cursorDate),
+                  and(
+                    eq(messages.createdAt, cursorDate),
+                    gt(messages.id, cursorId),
+                  ),
+                )
+              : gt(messages.createdAt, cursorDate)
+            : cursorId
+              ? or(
+                  lt(messages.createdAt, cursorDate),
+                  and(
+                    eq(messages.createdAt, cursorDate),
+                    lt(messages.id, cursorId),
+                  ),
+                )
+              : lt(messages.createdAt, cursorDate),
+          or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
+        )
       : and(
-        channelId
-          ? eq(messages.channelId, channelId)
-          : eq(messages.conversationId, conversationId!),
-        or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
-      )
+          channelId
+            ? eq(messages.channelId, channelId)
+            : eq(messages.conversationId, conversationId!),
+          or(isNull(messages.parentId), eq(messages.alsoSendToChannel, true)),
+        )
 
     const rows = (await this.db
       .select(this.getMessageSelectFields())
@@ -562,7 +885,11 @@ export class MessageService {
         eq(messages.parentId, sql`parents.id`),
       )
       .where(whereConditions)
-      .orderBy(...(direction === 'forward' ? [asc(messages.createdAt), asc(messages.id)] : [desc(messages.createdAt), desc(messages.id)]))
+      .orderBy(
+        ...(direction === 'forward'
+          ? [asc(messages.createdAt), asc(messages.id)]
+          : [desc(messages.createdAt), desc(messages.id)]),
+      )
       .limit(PAGE_SIZE + 1)) as MessageJoinRow[]
 
     const hasMore = rows.length > PAGE_SIZE
@@ -609,7 +936,12 @@ export class MessageService {
    * getThreadMessages — lấy danh sách reply trong một thread
    * Phân trang theo cursor (createdAt) tương tự getMessages.
    */
-  async getThreadMessages(parentId: string, userId: string, cursor?: string, direction: 'forward' | 'backward' = 'backward') {
+  async getThreadMessages(
+    parentId: string,
+    userId: string,
+    cursor?: string,
+    direction: 'forward' | 'backward' = 'backward',
+  ) {
     // 1. Lấy tin nhắn cha để biết channelId/conversationId
     const [parent] = await this.db
       .select({
@@ -641,26 +973,33 @@ export class MessageService {
     if (cursor) {
       const parts = cursor.split('|')
       cursorDate = new Date(parts[0])
-      cursorId = parts.length > 1 ? parts[1] : undefined; if (cursorDate && isNaN(cursorDate.getTime())) cursorDate = undefined
+      cursorId = parts.length > 1 ? parts[1] : undefined
+      if (cursorDate && isNaN(cursorDate.getTime())) cursorDate = undefined
     }
 
     const whereConditions = cursorDate
       ? and(
-        eq(messages.parentId, parentId),
-        direction === 'forward'
-          ? cursorId
-            ? or(
-              gt(messages.createdAt, cursorDate),
-              and(eq(messages.createdAt, cursorDate), gt(messages.id, cursorId))
-            )
-            : gt(messages.createdAt, cursorDate)
-          : cursorId
-            ? or(
-              lt(messages.createdAt, cursorDate),
-              and(eq(messages.createdAt, cursorDate), lt(messages.id, cursorId))
-            )
-            : lt(messages.createdAt, cursorDate),
-      )
+          eq(messages.parentId, parentId),
+          direction === 'forward'
+            ? cursorId
+              ? or(
+                  gt(messages.createdAt, cursorDate),
+                  and(
+                    eq(messages.createdAt, cursorDate),
+                    gt(messages.id, cursorId),
+                  ),
+                )
+              : gt(messages.createdAt, cursorDate)
+            : cursorId
+              ? or(
+                  lt(messages.createdAt, cursorDate),
+                  and(
+                    eq(messages.createdAt, cursorDate),
+                    lt(messages.id, cursorId),
+                  ),
+                )
+              : lt(messages.createdAt, cursorDate),
+        )
       : eq(messages.parentId, parentId)
 
     const rows = (await this.db
@@ -679,7 +1018,11 @@ export class MessageService {
         eq(messages.parentId, sql`parents.id`),
       )
       .where(whereConditions)
-      .orderBy(...(direction === 'forward' ? [asc(messages.createdAt), asc(messages.id)] : [desc(messages.createdAt), desc(messages.id)]))
+      .orderBy(
+        ...(direction === 'forward'
+          ? [asc(messages.createdAt), asc(messages.id)]
+          : [desc(messages.createdAt), desc(messages.id)]),
+      )
       .limit(PAGE_SIZE + 1)) as MessageJoinRow[]
 
     const hasMore = rows.length > PAGE_SIZE
@@ -703,12 +1046,16 @@ export class MessageService {
 
     return {
       messages: formattedMessages,
-      nextCursor: (direction === 'backward' && !hasMore) || messageRows.length === 0
-        ? null
-        : `${lastMsg.createdAt.toISOString()}|${lastMsg.id}`,
-      prevCursor: (!cursor) || (direction === 'forward' && !hasMore) || messageRows.length === 0
-        ? null
-        : `${firstMsg.createdAt.toISOString()}|${firstMsg.id}`,
+      nextCursor:
+        (direction === 'backward' && !hasMore) || messageRows.length === 0
+          ? null
+          : `${lastMsg.createdAt.toISOString()}|${lastMsg.id}`,
+      prevCursor:
+        !cursor ||
+        (direction === 'forward' && !hasMore) ||
+        messageRows.length === 0
+          ? null
+          : `${firstMsg.createdAt.toISOString()}|${firstMsg.id}`,
       hasMore,
     }
   }
@@ -729,12 +1076,16 @@ export class MessageService {
 
     return {
       messages: formattedMessages,
-      nextCursor: (direction === 'backward' && !hasMore) || messageRows.length === 0
-        ? null
-        : `${lastMsg.createdAt.toISOString()}|${lastMsg.id}`,
-      prevCursor: (!cursor) || (direction === 'forward' && !hasMore) || messageRows.length === 0
-        ? null
-        : `${firstMsg.createdAt.toISOString()}|${firstMsg.id}`,
+      nextCursor:
+        (direction === 'backward' && !hasMore) || messageRows.length === 0
+          ? null
+          : `${lastMsg.createdAt.toISOString()}|${lastMsg.id}`,
+      prevCursor:
+        !cursor ||
+        (direction === 'forward' && !hasMore) ||
+        messageRows.length === 0
+          ? null
+          : `${firstMsg.createdAt.toISOString()}|${firstMsg.id}`,
       hasMore,
     }
   }
@@ -775,9 +1126,9 @@ export class MessageService {
           JOIN ${directMessageConversations} dc ON dc.id = cm.conversation_id
           WHERE dc.workspace_id = ${dto.workspaceId}
             AND cm.user_id IN (${sql.join(
-          allUserIds.map((id) => sql`${id}`),
-          sql`, `,
-        )})
+              allUserIds.map((id) => sql`${id}`),
+              sql`, `,
+            )})
           GROUP BY cm.conversation_id
           HAVING COUNT(DISTINCT cm.user_id) = ${memberCount}
              AND (SELECT COUNT(*) FROM ${conversationMembers} WHERE conversation_id = cm.conversation_id) = ${memberCount}
@@ -826,12 +1177,14 @@ export class MessageService {
       workspaceId = conv.workspaceId
     }
 
+    let huddleSessionId: string | undefined
     if (dto.parentId) {
       const [par] = await this.db
         .select({
           type: messages.type,
           allowEdit: messages.allowEdit,
           parentId: messages.parentId,
+          huddleSessionId: messages.huddleSessionId,
         })
         .from(messages)
         .where(eq(messages.id, dto.parentId))
@@ -841,11 +1194,35 @@ export class MessageService {
       }
       const isTimelineRoot =
         par.type === 'timeline' ||
-        (par.type === 'text' &&
-          par.allowEdit === false &&
-          par.parentId == null)
+        (par.type === 'text' && par.allowEdit === false && par.parentId == null)
       if (isTimelineRoot) {
         throw new BadRequestException('Cannot reply to this message')
+      }
+      // Copy huddleSessionId from parent message so replies are linked to the huddle
+      huddleSessionId = par.huddleSessionId ?? undefined
+    }
+
+    if (actualChannelId) {
+      const postingPermission = await this.getChannelPostingPermission(
+        actualChannelId,
+        userId,
+      )
+      const isThreadReply = Boolean(dto.parentId)
+      if (isThreadReply) {
+        if (!postingPermission.canReply) {
+          throw new ForbiddenException(
+            'Only certain people can reply in this channel',
+          )
+        }
+        if (dto.alsoSendToChannel && !postingPermission.canSendToChannel) {
+          throw new ForbiddenException(
+            'Only certain people can post in this channel',
+          )
+        }
+      } else if (!postingPermission.canPost) {
+        throw new ForbiddenException(
+          'Only certain people can post in this channel',
+        )
       }
     }
 
@@ -862,6 +1239,7 @@ export class MessageService {
             content: dto.content,
             type: 'text',
             parentId: dto.parentId ?? null,
+            huddleSessionId: huddleSessionId ?? null,
             alsoSendToChannel: dto.alsoSendToChannel ?? false,
             forwardSnapshot:
               options != null && 'forwardSnapshot' in options
@@ -872,23 +1250,28 @@ export class MessageService {
 
         let insertedAttachments: any[] = []
         if (dto.attachments && dto.attachments.length > 0) {
-          const attachmentValues = dto.attachments.map((a) => ({
-            id: randomUUID(),
-            messageId: insertedMessage.id,
-            workspaceId,
-            userId,
-            channelId: actualChannelId ?? null,
-            conversationId: actualConversationId ?? null,
-            ...a,
-            originScope: options?.attachmentOriginScope ?? 'message_body',
-          }))
+          const attachmentValues = await Promise.all(
+            dto.attachments.map((a) =>
+              this.buildAttachmentInsertValue(a, {
+                messageId: insertedMessage.id,
+                workspaceId,
+                userId,
+                channelId: actualChannelId ?? null,
+                conversationId: actualConversationId ?? null,
+                originScope: options?.attachmentOriginScope ?? 'message_body',
+              }),
+            ),
+          )
           insertedAttachments = await tx
             .insert(attachments)
             .values(attachmentValues)
             .returning()
         }
 
-        return { message: insertedMessage, createdAttachments: insertedAttachments }
+        return {
+          message: insertedMessage,
+          createdAttachments: insertedAttachments,
+        }
       },
     )
 
@@ -896,7 +1279,7 @@ export class MessageService {
     await this.redis.del(this.messageCacheKey(targetId))
 
     // Enqueue notification job (Background)
-    this.logger.log(`Enqueuing notification job for message ${message.id}`);
+    this.logger.log(`Enqueuing notification job for message ${message.id}`)
     await this.notificationService.enqueueNotificationJob({
       messageId: message.id,
       senderId: userId,
@@ -904,7 +1287,8 @@ export class MessageService {
       channelId: actualChannelId,
       conversationId: actualConversationId,
       content: dto.content,
-    });
+      parentId: dto.parentId ?? null,
+    })
 
     // Nếu là DM, cập nhật thông tin tin nhắn cuối cho conversation
     if (actualConversationId) {
@@ -989,6 +1373,15 @@ export class MessageService {
       recipientIds = Array.from(
         new Set([...recipientIds, ...subscribers.map((s) => s.userId)]),
       )
+
+      await this.notificationService.createReplyNotifications({
+        actorId: userId,
+        workspaceId,
+        messageId: message.id,
+        parentMessageId: dto.parentId,
+        channelId: actualChannelId ?? null,
+        conversationId: actualConversationId ?? null,
+      })
     }
 
     const user = await this.getAuthorProfileForWorkspace(userId, workspaceId)
@@ -1000,8 +1393,12 @@ export class MessageService {
     // Lấy attachments của tin nhắn cha nếu cần thiết cho alsoSendToChannel
     let parentAttachments: any[] = []
     if (dto.parentId && dto.alsoSendToChannel) {
-      parentAttachments = await this.attachmentService.getAttachmentsByMessageIds([dto.parentId]).then(map => map.get(dto.parentId!) ?? [])
-      parentAttachments = await Promise.all(parentAttachments.map(a => this.enrichAttachmentWithSignedUrl(a)))
+      parentAttachments = await this.attachmentService
+        .getAttachmentsByMessageIds([dto.parentId])
+        .then((map) => map.get(dto.parentId!) ?? [])
+      parentAttachments = await Promise.all(
+        parentAttachments.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+      )
     }
 
     return {
@@ -1021,13 +1418,14 @@ export class MessageService {
       recipientIds, // Thêm vào để controller có thể dùng broadcast
       parentReplyCount, // Trả về để broadcast cập nhật UI
       parentReplyParticipantIds,
-      parent: dto.parentId && dto.alsoSendToChannel
-        ? {
-            content: parentDeletedAt ? '' : (parentContent ?? ''),
-            deletedAt: parentDeletedAt?.toISOString() ?? null,
-            attachments: parentAttachments,
-          }
-        : undefined,
+      parent:
+        dto.parentId && dto.alsoSendToChannel
+          ? {
+              content: parentDeletedAt ? '' : (parentContent ?? ''),
+              deletedAt: parentDeletedAt?.toISOString() ?? null,
+              attachments: parentAttachments,
+            }
+          : undefined,
     }
   }
 
@@ -1076,10 +1474,7 @@ export class MessageService {
           )
         }
       } else {
-        const c = await this.assertConversationAccess(
-          d.conversationId,
-          userId,
-        )
+        const c = await this.assertConversationAccess(d.conversationId, userId)
         if (c.workspaceId !== sourceWorkspaceId) {
           throw new ForbiddenException(
             'Destination must be in the same workspace as the source message',
@@ -1089,8 +1484,7 @@ export class MessageService {
     }
 
     const commentaryRaw = (dto.commentary ?? '').trim()
-    const commentaryHtml =
-      commentaryRaw.length > 0 ? commentaryRaw : '<p></p>'
+    const commentaryHtml = commentaryRaw.length > 0 ? commentaryRaw : '<p></p>'
 
     const nestedSnap = this.parseNestedForwardSnapshot(src.forwardSnapshot)
     const isMixedForward =
@@ -1130,7 +1524,10 @@ export class MessageService {
         )
 
     const createOpts = isMixedForward
-      ? { forwardSnapshot: null as null, attachmentOriginScope: 'message_body' as const }
+      ? {
+          forwardSnapshot: null,
+          attachmentOriginScope: 'message_body' as const,
+        }
       : {
           forwardSnapshot: forwardSnapshotRecord,
           attachmentOriginScope: 'forward_quote' as const,
@@ -1142,7 +1539,12 @@ export class MessageService {
         d.type === 'channel'
           ? { channelId: d.channelId }
           : { conversationId: d.conversationId }
-      const msg = await this.createMessage(params, userId, createDto, createOpts)
+      const msg = await this.createMessage(
+        params,
+        userId,
+        createDto,
+        createOpts,
+      )
       results.push(msg)
     }
     return results
@@ -1152,6 +1554,8 @@ export class MessageService {
     kind:
       | 'channel_topic'
       | 'channel_description'
+      | 'channel_posting_permissions'
+      | 'channel_privacy'
       | 'dm_topic'
       | 'dm_description'
       | 'dm_merge'
@@ -1164,13 +1568,19 @@ export class MessageService {
     if (kind === 'dm_merge') {
       return 'Moved messages from a previous conversation into this one.'
     }
+    if (kind === 'channel_posting_permissions') {
+      return 'changed the channel posting permissions'
+    }
+    if (kind === 'channel_privacy') {
+      return value === 'private'
+        ? 'changed the channel to private'
+        : 'changed the channel to public'
+    }
     const scope = kind.startsWith('dm_') ? 'conversation' : 'channel'
     const isTopic = kind.endsWith('_topic')
     const v = value?.trim() ? value.trim() : null
     if (isTopic) {
-      return v
-        ? `set the ${scope} topic: ${v}`
-        : `removed the ${scope} topic`
+      return v ? `set the ${scope} topic: ${v}` : `removed the ${scope} topic`
     }
     return v
       ? `set the ${scope} description: ${v}`
@@ -1186,6 +1596,8 @@ export class MessageService {
     kind:
       | 'channel_topic'
       | 'channel_description'
+      | 'channel_posting_permissions'
+      | 'channel_privacy'
       | 'dm_topic'
       | 'dm_description'
       | 'dm_merge'
@@ -1252,7 +1664,10 @@ export class MessageService {
       recipientIds = memberRows.map((m) => m.userId)
     }
 
-    const user = await this.getAuthorProfileForWorkspace(actorUserId, workspaceId)
+    const user = await this.getAuthorProfileForWorkspace(
+      actorUserId,
+      workspaceId,
+    )
     const message = insertedMessage
 
     return {
@@ -1275,13 +1690,16 @@ export class MessageService {
   /**
    * Lấy danh sách ID người dùng cần nhận broadcast cho một tin nhắn (hoặc thread)
    */
-  async getRecipientIds(messageId: string, parentId?: string | null): Promise<{ recipientIds: string[], workspaceId: string }> {
+  async getRecipientIds(
+    messageId: string,
+    parentId?: string | null,
+  ): Promise<{ recipientIds: string[]; workspaceId: string }> {
     let recipientIds: string[] = []
     let workspaceId: string = ''
 
     // 1. Lấy workspaceId từ message, kèm theo conversationId
     const [msg] = await this.db
-      .select({ 
+      .select({
         conversationId: messages.conversationId,
         workspaceId: messages.workspaceId,
       })
@@ -1290,7 +1708,7 @@ export class MessageService {
       .limit(1)
 
     if (!msg) return { recipientIds, workspaceId }
-    
+
     workspaceId = msg.workspaceId || ''
 
     if (msg.conversationId) {
@@ -1302,11 +1720,15 @@ export class MessageService {
     }
 
     // 2. Nếu thuộc thread, lấy tất cả người đã subscribe thread đó
-    const threadId = parentId || (await this.db
-      .select({ parentId: messages.parentId })
-      .from(messages)
-      .where(eq(messages.id, messageId))
-      .limit(1))[0]?.parentId
+    const threadId =
+      parentId ||
+      (
+        await this.db
+          .select({ parentId: messages.parentId })
+          .from(messages)
+          .where(eq(messages.id, messageId))
+          .limit(1)
+      )[0]?.parentId
 
     if (threadId) {
       const subscribers = await this.db
@@ -1368,12 +1790,20 @@ export class MessageService {
       await this.assertConversationAccess(row.conversationId, userId)
     }
 
-    const [recipientIds, { reactionsByMessage, attachmentsMap }] = await Promise.all([
-      this.getRecipientIds(messageId, row.parentId),
-      this.fetchMetadataForMessages([messageId], row.parentId ? [row.parentId] : [])
-    ])
+    const [recipientIds, { reactionsByMessage, attachmentsMap }] =
+      await Promise.all([
+        this.getRecipientIds(messageId, row.parentId),
+        this.fetchMetadataForMessages(
+          [messageId],
+          row.parentId ? [row.parentId] : [],
+        ),
+      ])
 
-    const formatted = await this.formatMessageRow(row, reactionsByMessage, attachmentsMap)
+    const formatted = await this.formatMessageRow(
+      row,
+      reactionsByMessage,
+      attachmentsMap,
+    )
     return { ...formatted, recipientIds }
   }
 
@@ -1409,14 +1839,18 @@ export class MessageService {
         eq(messages.parentId, sql`parents.id`),
       )
       .where(inArray(messages.id, messageIds))) as (MessageJoinRow & {
-        workspaceId: string
-      })[]
+      workspaceId: string
+    })[]
 
     if (rows.length === 0) return new Map<string, any>()
 
     // 2. Check access for unique channels and conversations
-    const channelIds = [...new Set(rows.map((r) => r.channelId).filter(Boolean))] as string[]
-    const conversationIds = [...new Set(rows.map((r) => r.conversationId).filter(Boolean))] as string[]
+    const channelIds = [
+      ...new Set(rows.map((r) => r.channelId).filter(Boolean)),
+    ] as string[]
+    const conversationIds = [
+      ...new Set(rows.map((r) => r.conversationId).filter(Boolean)),
+    ] as string[]
 
     await Promise.all([
       ...channelIds.map((id) => this.assertChannelAccess(id, userId)),
@@ -1425,14 +1859,17 @@ export class MessageService {
 
     // 3. Fetch metadata in bulk
     const parentIds = rows.map((r) => r.parentId).filter(Boolean) as string[]
-    const { reactionsByMessage, attachmentsMap } = await this.fetchMetadataForMessages(
-      rows.map((r) => r.id),
-      parentIds,
-    )
+    const { reactionsByMessage, attachmentsMap } =
+      await this.fetchMetadataForMessages(
+        rows.map((r) => r.id),
+        parentIds,
+      )
 
     // 4. Format all rows
     const formattedMessages = await Promise.all(
-      rows.map((row) => this.formatMessageRow(row, reactionsByMessage, attachmentsMap)),
+      rows.map((row) =>
+        this.formatMessageRow(row, reactionsByMessage, attachmentsMap),
+      ),
     )
 
     return new Map(formattedMessages.map((m) => [m.id, m]))
@@ -1470,6 +1907,7 @@ export class MessageService {
         email: users.email,
         accountName: users.name,
         accountAvatar: users.avatar,
+        wmId: workspaceMembers.id,
         wmName: workspaceMembers.name,
         wmAvatar: workspaceMembers.avatar,
         displayName: workspaceMembers.displayName,
@@ -1492,14 +1930,21 @@ export class MessageService {
 
     if (!row) throw new NotFoundException('User not found')
 
-    const name = row.wmName ?? row.accountName ?? null
-    const avatar = row.wmAvatar ?? row.accountAvatar ?? null
+    const isRemovedWorkspaceMember = row.wmId == null
+    const name = isRemovedWorkspaceMember
+      ? 'deactivated user'
+      : (row.wmName ?? row.accountName ?? null)
+    const avatar = isRemovedWorkspaceMember
+      ? null
+      : (row.wmAvatar ?? row.accountAvatar ?? null)
     const profile = {
       id: row.id,
       name,
       avatar,
-      email: row.email,
-      displayName: row.displayName ?? name,
+      email: isRemovedWorkspaceMember ? '' : row.email,
+      displayName: isRemovedWorkspaceMember
+        ? 'deactivated user'
+        : (row.displayName ?? name),
       isAway: row.isAway ?? false,
       namePronunciation: row.namePronunciation ?? null,
       phone: row.phone ?? null,
@@ -1525,6 +1970,7 @@ export class MessageService {
         channelId: messages.channelId,
         conversationId: messages.conversationId,
         workspaceId: sql<string>`COALESCE(${channels.workspaceId}, ${directMessageConversations.workspaceId})`,
+        type: messages.type,
       })
       .from(messages)
       .leftJoin(channels, eq(messages.channelId, channels.id))
@@ -1534,18 +1980,21 @@ export class MessageService {
       )
       .where(eq(messages.id, messageId))
       .limit(1)) as Array<{
-        id: string
-        userId: string
-        deletedAt: Date | null
-        allowEdit: boolean
-        channelId: string | null
-        conversationId: string | null
-        workspaceId: string
-      }>
+      id: string
+      userId: string
+      deletedAt: Date | null
+      allowEdit: boolean
+      channelId: string | null
+      conversationId: string | null
+      workspaceId: string
+      type: string
+    }>
 
     if (!message) throw new NotFoundException('Message not found')
     if (message.userId !== userId)
       throw new ForbiddenException('Not your message')
+    if (message.type === 'huddle')
+      throw new ForbiddenException('This message cannot be edited')
     if (message.deletedAt)
       throw new ForbiddenException('Cannot edit deleted message')
     if (message.allowEdit === false)
@@ -1554,7 +2003,38 @@ export class MessageService {
     const targetId = (message.channelId || message.conversationId) as string
     const workspaceId = message.workspaceId
 
-    const updated = await this.db.transaction(async (tx) => {
+    const attachmentsToDelete =
+      dto.deletedAttachmentIds && dto.deletedAttachmentIds.length > 0
+        ? ((await this.db
+            .select({
+              id: attachments.id,
+              url: attachments.url,
+              type: attachments.type,
+            })
+            .from(attachments)
+            .where(
+              and(
+                inArray(attachments.id, dto.deletedAttachmentIds),
+                eq(attachments.messageId, messageId),
+                ne(attachments.originScope, 'forward_quote'),
+              ),
+            )) as Array<{
+            id: string
+            url: string
+            type: string
+          }>)
+        : []
+
+    if (attachmentsToDelete.length > 0) {
+      await this.attachmentService.deleteAttachmentStorageBatch(
+        attachmentsToDelete,
+      )
+    }
+
+    await this.db.transaction(async (tx) => {
+      let insertedAttachments: Array<{
+        id: string
+      }> = []
       // 1. Xóa attachments nếu có yêu cầu
       if (dto.deletedAttachmentIds && dto.deletedAttachmentIds.length > 0) {
         await tx
@@ -1570,40 +2050,48 @@ export class MessageService {
 
       // 2. Thêm attachments mới nếu có
       if (dto.attachments && dto.attachments.length > 0) {
-        const attachmentValues = dto.attachments.map((a) => ({
-          id: randomUUID(),
-          messageId,
-          workspaceId,
-          userId,
-          channelId: message.channelId,
-          conversationId: message.conversationId,
-          ...a,
-          originScope: 'message_body',
-        }))
-        await tx.insert(attachments).values(attachmentValues)
+        const attachmentValues = await Promise.all(
+          dto.attachments.map((a) =>
+            this.buildAttachmentInsertValue(a, {
+              messageId,
+              workspaceId,
+              userId,
+              channelId: message.channelId,
+              conversationId: message.conversationId,
+              originScope: 'message_body',
+            }),
+          ),
+        )
+        insertedAttachments = await tx
+          .insert(attachments)
+          .values(attachmentValues)
+          .returning({
+            id: attachments.id,
+          })
       }
 
       // 3. Cập nhật nội dung tin nhắn
       const [updatedMessage] = (await tx
         .update(messages)
         .set({
-          content: dto.content !== undefined ? dto.content : sql`${messages.content}`,
+          content:
+            dto.content !== undefined ? dto.content : sql`${messages.content}`,
           editedAt: new Date(),
         })
         .where(eq(messages.id, messageId))
         .returning()) as Array<{
-          id: string
-          channelId: string | null
-          conversationId: string | null
-          userId: string
-          content: string
-          type: string
-          parentId: string | null
-          editedAt: Date | null
-          deletedAt: Date | null
-          createdAt: Date
-          updatedAt: Date
-        }>
+        id: string
+        channelId: string | null
+        conversationId: string | null
+        userId: string
+        content: string
+        type: string
+        parentId: string | null
+        editedAt: Date | null
+        deletedAt: Date | null
+        createdAt: Date
+        updatedAt: Date
+      }>
 
       // 4. Kiểm tra xem tin nhắn có bị rỗng không (không content + không attachments)
       const remainingAttachments = await tx
@@ -1620,13 +2108,14 @@ export class MessageService {
         )
       }
 
-      return updatedMessage
+      return { updatedMessage, insertedAttachments }
     })
 
     // Invalidate cache
     await this.redis.del(this.messageCacheKey(targetId))
 
     // Trả về full message (kèm user, attachments) để broadcast có đầy đủ data
+
     return this.getMessageById(messageId, userId)
   }
 
@@ -1636,23 +2125,36 @@ export class MessageService {
       .select({
         id: messages.id,
         userId: messages.userId,
+        workspaceId: messages.workspaceId,
         channelId: messages.channelId,
         conversationId: messages.conversationId,
         parentId: messages.parentId,
+        type: messages.type,
       })
       .from(messages)
       .where(eq(messages.id, messageId))
       .limit(1)) as Array<{
-        id: string
-        userId: string
-        channelId: string | null
-        conversationId: string | null
-        parentId: string | null
-      }>
+      id: string
+      userId: string
+      workspaceId: string | null
+      channelId: string | null
+      conversationId: string | null
+      parentId: string | null
+      type: string
+    }>
 
     if (!message) throw new NotFoundException('Message not found')
     if (message.userId !== userId)
       throw new ForbiddenException('Not your message')
+    if (message.type === 'huddle')
+      throw new ForbiddenException('This message cannot be deleted')
+    if (message.workspaceId) {
+      await this.permissionsService.requireUserPermission(
+        message.workspaceId,
+        userId,
+        'delete_own_messages',
+      )
+    }
 
     const targetId = (message.channelId || message.conversationId) as string
     const room = message.channelId
@@ -1663,6 +2165,13 @@ export class MessageService {
       .update(messages)
       .set({ deletedAt: new Date(), content: '' })
       .where(eq(messages.id, messageId))
+
+    if (message.workspaceId) {
+      await this.laterService.purgeAllItemsForMessage(
+        message.workspaceId,
+        messageId,
+      )
+    }
 
     // Invalidate cache vì message đã bị xóa (soft delete)
     await this.redis.del(this.messageCacheKey(targetId))
@@ -1682,12 +2191,12 @@ export class MessageService {
       .from(messages)
       .where(eq(messages.id, messageId))
       .limit(1)) as Array<{
-        id: string
-        isPinned: boolean
-        channelId: string | null
-        conversationId: string | null
-        parentId: string | null
-      }>
+      id: string
+      isPinned: boolean
+      channelId: string | null
+      conversationId: string | null
+      parentId: string | null
+    }>
 
     if (!message) throw new NotFoundException('Message not found')
 
@@ -1712,7 +2221,12 @@ export class MessageService {
     // Invalidate cache
     await this.redis.del(this.messageCacheKey(targetId))
 
-    return { messageId, isPinned: newPinnedStatus, room, parentId: message.parentId }
+    return {
+      messageId,
+      isPinned: newPinnedStatus,
+      room,
+      parentId: message.parentId,
+    }
   }
 
   /** Lấy danh sách tin nhắn đã ghim */
@@ -1756,8 +2270,8 @@ export class MessageService {
         ),
       )
       .orderBy(desc(messages.createdAt))) as (MessageJoinRow & {
-        isPinned: boolean
-      })[]
+      isPinned: boolean
+    })[]
 
     const messageIds = rows.map((r) => r.id)
     const parentIds = rows
@@ -1786,14 +2300,19 @@ export class MessageService {
       .select({
         channelId: messages.channelId,
         conversationId: messages.conversationId,
+        parentId: messages.parentId,
+        workspaceId: messages.workspaceId,
+        ownerUserId: messages.userId,
       })
       .from(messages)
       .where(eq(messages.id, messageId))
       .limit(1)) as Array<{
-        channelId: string | null
-        conversationId: string | null
-        parentId: string | null
-      }>
+      channelId: string | null
+      conversationId: string | null
+      parentId: string | null
+      workspaceId: string
+      ownerUserId: string
+    }>
 
     if (!messageRow) throw new NotFoundException('Message not found')
 
@@ -1815,11 +2334,15 @@ export class MessageService {
 
     if (existing) {
       await this.db.delete(reactions).where(eq(reactions.id, existing.id))
+      const { reactionsByMessage } = await this.fetchMetadataForMessages([
+        messageId,
+      ])
       return {
         action: 'removed',
         emoji: dto.emoji,
         room,
         parentId: messageRow.parentId,
+        reactions: reactionsByMessage[messageId] ?? [],
       }
     } else {
       await this.db.insert(reactions).values({
@@ -1828,11 +2351,23 @@ export class MessageService {
         userId,
         emoji: dto.emoji,
       })
+      await this.notificationService.createReactionNotification({
+        actorId: userId,
+        workspaceId: messageRow.workspaceId,
+        messageId,
+        ownerUserId: messageRow.ownerUserId,
+        channelId: messageRow.channelId,
+        conversationId: messageRow.conversationId,
+      })
+      const { reactionsByMessage } = await this.fetchMetadataForMessages([
+        messageId,
+      ])
       return {
         action: 'added',
         emoji: dto.emoji,
         room,
         parentId: messageRow.parentId,
+        reactions: reactionsByMessage[messageId] ?? [],
       }
     }
   }
@@ -1851,6 +2386,46 @@ export class MessageService {
     return { at, id }
   }
 
+  async assertRealtimeWorkspaceAccess(workspaceId: string, userId: string) {
+    await this.assertWorkspaceAccess(workspaceId, userId)
+  }
+
+  async assertRealtimeChannelAccess(channelId: string, userId: string) {
+    await this.assertChannelAccess(channelId, userId)
+  }
+
+  async assertRealtimeConversationAccess(
+    conversationId: string,
+    userId: string,
+  ) {
+    await this.assertConversationAccess(conversationId, userId)
+  }
+
+  async assertRealtimeThreadAccess(parentMessageId: string, userId: string) {
+    const [parent] = await this.db
+      .select({
+        channelId: messages.channelId,
+        conversationId: messages.conversationId,
+      })
+      .from(messages)
+      .where(eq(messages.id, parentMessageId))
+      .limit(1)
+
+    if (!parent) throw new NotFoundException('Parent message not found')
+
+    if (parent.channelId) {
+      await this.assertChannelAccess(parent.channelId, userId)
+      return
+    }
+
+    if (parent.conversationId) {
+      await this.assertConversationAccess(parent.conversationId, userId)
+      return
+    }
+
+    throw new NotFoundException('Thread target not found')
+  }
+
   private async assertTargetAccess(
     target: { channelId?: string; conversationId?: string },
     userId: string,
@@ -1867,6 +2442,346 @@ export class MessageService {
       return { workspaceId: conv.workspaceId }
     }
     throw new NotFoundException('Target not specified')
+  }
+
+  private normalizedContentExpr(messageTable = messages) {
+    return sql<string>`
+      trim(
+        regexp_replace(
+          regexp_replace(
+            regexp_replace(
+              regexp_replace(
+                COALESCE(${messageTable.content}, ''),
+                '<a[^>]*href\\s*=\\s*["'']([^"'']+)["''][^>]*>',
+                ' \\1 ',
+                'gi'
+              ),
+              '<[^>]+>',
+              ' ',
+              'g'
+            ),
+            '&nbsp;',
+            ' ',
+            'g'
+          ),
+          '[[:space:]]+',
+          ' ',
+          'g'
+        )
+      )
+    `
+  }
+
+  async searchWorkspaceMessages(
+    workspaceId: string,
+    userId: string,
+    dto: SearchWorkspaceMessagesDto,
+  ) {
+    await this.assertWorkspaceAccess(workspaceId, userId)
+
+    const trimmedQuery = dto.q?.trim()
+    const hasTextQuery = Boolean(trimmedQuery)
+    const normalizedContent = this.normalizedContentExpr(messages)
+    const escapedLikeQuery = trimmedQuery
+      ? `%${trimmedQuery.replace(/[\\%_]/g, '\\$&')}%`
+      : null
+    const tsQuery = hasTextQuery
+      ? sql`websearch_to_tsquery('simple', ${trimmedQuery!})`
+      : null
+    const tsVector = sql`to_tsvector('simple', ${normalizedContent})`
+    const rankExpr = hasTextQuery
+      ? sql<number>`ts_rank_cd(${tsVector}, ${tsQuery!})`
+      : sql<number | null>`NULL`
+    const excerptExpr = hasTextQuery
+      ? sql<string>`
+          ts_headline(
+            'simple',
+            ${normalizedContent},
+            ${tsQuery!},
+            'MaxFragments=2, MaxWords=18, MinWords=8, StartSel=<mark>, StopSel=</mark>'
+          )
+        `
+      : sql<string>`left(${normalizedContent}, 240)`
+
+    const conditions = [
+      eq(messages.workspaceId, workspaceId),
+      isNull(messages.deletedAt),
+      ne(messages.type, 'system'),
+      ne(messages.type, 'timeline'),
+      or(
+        and(
+          sql`${messages.channelId} IS NOT NULL`,
+          eq(channels.isPrivate, false),
+        ),
+        sql`EXISTS (
+          SELECT 1
+          FROM channel_members cm_visible
+          WHERE cm_visible.channel_id = ${messages.channelId}
+            AND cm_visible.user_id = ${userId}
+        )`,
+        sql`EXISTS (
+          SELECT 1
+          FROM conversation_members conv_visible
+          WHERE conv_visible.conversation_id = ${messages.conversationId}
+            AND conv_visible.user_id = ${userId}
+        )`,
+      ),
+      hasTextQuery
+        ? or(
+            sql`${tsVector} @@ ${tsQuery!}`,
+            sql`${normalizedContent} ILIKE ${escapedLikeQuery!} ESCAPE '\'`,
+          )
+        : undefined,
+      dto.fromUserIds.length > 0
+        ? inArray(messages.userId, dto.fromUserIds)
+        : undefined,
+      dto.channelIds.length > 0 && dto.conversationIds.length > 0
+        ? or(
+            inArray(messages.channelId, dto.channelIds),
+            inArray(messages.conversationId, dto.conversationIds),
+          )
+        : dto.channelIds.length > 0
+          ? inArray(messages.channelId, dto.channelIds)
+          : dto.conversationIds.length > 0
+            ? inArray(messages.conversationId, dto.conversationIds)
+            : undefined,
+      dto.afterDate
+        ? sql`${messages.createdAt} >= (${dto.afterDate}::date)`
+        : undefined,
+      dto.beforeDate
+        ? sql`${messages.createdAt} < (${dto.beforeDate}::date + INTERVAL '1 day')`
+        : undefined,
+      dto.has.includes('file')
+        ? sql`EXISTS (
+            SELECT 1
+            FROM attachments a_file
+            WHERE a_file.message_id = ${messages.id}
+          )`
+        : undefined,
+      dto.has.includes('link')
+        ? or(
+            sql`${messages.content} ~* '<a\\s[^>]*href\\s*='`,
+            sql`${this.normalizedContentExpr()} ~* '(^|[[:space:]])((https?://)|(www\\.))[[:graph:]]+'`,
+          )
+        : undefined,
+      dto.has.includes('reaction')
+        ? sql`EXISTS (
+            SELECT 1
+            FROM reactions r_search
+            WHERE r_search.message_id = ${messages.id}
+          )`
+        : undefined,
+      dto.types.length > 0
+        ? (() => {
+            const fileCategories = dto.types.flatMap((type) => {
+              switch (type) {
+                case 'documents':
+                  return ['document']
+                case 'spreadsheets':
+                  return ['spreadsheet']
+                case 'presentations':
+                  return ['presentation']
+                case 'pdfs':
+                  return ['pdf']
+                case 'audio':
+                  return ['audio']
+                case 'images':
+                  return ['image']
+                case 'videos':
+                  return ['video']
+                case 'snippets':
+                  return ['code']
+                default:
+                  return []
+              }
+            })
+            return sql`EXISTS (
+              SELECT 1
+              FROM attachments a_type
+              WHERE a_type.message_id = ${messages.id}
+                AND a_type.file_category IN (${sql.join(
+                  fileCategories.map((category) => sql`${category}`),
+                  sql`, `,
+                )})
+            )`
+          })()
+        : undefined,
+      dto.is.includes('dm')
+        ? sql`${messages.conversationId} IS NOT NULL`
+        : undefined,
+      dto.is.includes('thread')
+        ? or(sql`${messages.parentId} IS NOT NULL`, gt(messages.replyCount, 0))
+        : undefined,
+      dto.is.includes('saved')
+        ? sql`EXISTS (
+            SELECT 1
+            FROM saved_items s_saved
+            WHERE s_saved.user_id = ${userId}
+              AND s_saved.workspace_id = ${workspaceId}
+              AND s_saved.type = 'message'
+              AND s_saved.status = 'in_progress'
+              AND s_saved.message_id = ${messages.id}
+          )`
+        : undefined,
+      dto.is.includes('pinned') ? eq(messages.isPinned, true) : undefined,
+      dto.withUserIds.length > 0
+        ? or(
+            and(
+              sql`${messages.conversationId} IS NOT NULL`,
+              ...dto.withUserIds.map(
+                (withUserId) => sql`EXISTS (
+                  SELECT 1
+                  FROM conversation_members conv_with
+                  WHERE conv_with.conversation_id = ${messages.conversationId}
+                    AND conv_with.user_id = ${withUserId}
+                )`,
+              ),
+            ),
+            and(
+              sql`${messages.channelId} IS NOT NULL`,
+              ...dto.withUserIds.map(
+                (withUserId) => sql`EXISTS (
+                  SELECT 1
+                  FROM messages m_with
+                  WHERE COALESCE(m_with.parent_id, m_with.id) = COALESCE(${messages.parentId}, ${messages.id})
+                    AND m_with.user_id = ${withUserId}
+                )`,
+              ),
+            ),
+          )
+        : undefined,
+    ]
+
+    const whereExpr = and(...conditions)
+
+    const countQuery = this.db
+      .select({
+        total: sql<number>`count(*)`,
+      })
+      .from(messages)
+      .leftJoin(channels, eq(messages.channelId, channels.id))
+      .where(whereExpr)
+
+    const rowsQuery = this.db
+      .select({
+        ...this.getMessageSelectFields(),
+        rank: rankExpr,
+        excerpt: excerptExpr,
+        channelName: channels.name,
+        channelIsPrivate: channels.isPrivate,
+        conversationIsGroup: directMessageConversations.isGroup,
+        conversationLabel: sql<string | null>`
+          CASE
+            WHEN ${directMessageConversations.id} IS NULL THEN NULL
+            ELSE (
+              SELECT NULLIF(
+                string_agg(
+                  COALESCE(wm_conv.display_name, wm_conv.name, u_conv.name, u_conv.email),
+                  ', '
+                  ORDER BY COALESCE(wm_conv.display_name, wm_conv.name, u_conv.name, u_conv.email)
+                ),
+                ''
+              )
+              FROM conversation_members conv_label
+              INNER JOIN users u_conv ON u_conv.id = conv_label.user_id
+              LEFT JOIN workspace_members wm_conv
+                ON wm_conv.workspace_id = ${workspaceId}
+               AND wm_conv.user_id = conv_label.user_id
+              WHERE conv_label.conversation_id = ${messages.conversationId}
+                AND conv_label.user_id <> ${userId}
+            )
+          END
+        `,
+      })
+      .from(messages)
+      .leftJoin(channels, eq(messages.channelId, channels.id))
+      .leftJoin(
+        directMessageConversations,
+        eq(messages.conversationId, directMessageConversations.id),
+      )
+      .innerJoin(users, eq(messages.userId, users.id))
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, messages.userId),
+        ),
+      )
+      .leftJoin(
+        sql`${messages} AS parents`,
+        eq(messages.parentId, sql`parents.id`),
+      )
+      .where(whereExpr)
+
+    const sort = dto.sort === 'relevance' && !hasTextQuery ? 'newest' : dto.sort
+
+    const orderedRowsQuery =
+      sort === 'relevance'
+        ? rowsQuery.orderBy(
+            desc(rankExpr),
+            desc(messages.createdAt),
+            desc(messages.id),
+          )
+        : sort === 'oldest'
+          ? rowsQuery.orderBy(asc(messages.createdAt), asc(messages.id))
+          : rowsQuery.orderBy(desc(messages.createdAt), desc(messages.id))
+
+    const [[countRow], rows] = await Promise.all([
+      countQuery,
+      orderedRowsQuery.limit(dto.limit).offset(dto.offset),
+    ])
+
+    const pageRows = rows as WorkspaceMessageSearchRow[]
+    const messageIds = pageRows.map((row) => row.id)
+    const parentIds = pageRows
+      .filter((row) => row.parentId && row.alsoSendToChannel)
+      .map((row) => row.parentId) as string[]
+
+    const { reactionsByMessage, attachmentsMap } =
+      await this.fetchMetadataForMessages(messageIds, parentIds)
+
+    const items = await Promise.all(
+      pageRows.map(async (row) => {
+        const message = await this.formatMessageRow(
+          row,
+          reactionsByMessage,
+          attachmentsMap,
+        )
+
+        return {
+          message,
+          rank:
+            row.rank == null || Number.isNaN(Number(row.rank))
+              ? null
+              : Number(row.rank),
+          excerpt: row.excerpt || '',
+          location: row.channelId
+            ? {
+                kind: 'channel' as const,
+                channelId: row.channelId,
+                channelName: row.channelName ?? 'Channel',
+                isPrivate: Boolean(row.channelIsPrivate),
+              }
+            : {
+                kind: 'conversation' as const,
+                conversationId: row.conversationId!,
+                conversationLabel:
+                  row.conversationLabel?.trim() || 'Direct Message',
+                isGroup: Boolean(row.conversationIsGroup),
+              },
+        }
+      }),
+    )
+
+    const total = Number(countRow?.total ?? 0)
+
+    return {
+      items,
+      total,
+      limit: dto.limit,
+      offset: dto.offset,
+      hasMore: dto.offset + items.length < total,
+    }
   }
 
   private async mapFileJoinRowsToHits(rows: ChannelFileJoinRow[]) {
@@ -1954,12 +2869,12 @@ export class MessageService {
     const parsed = this.parseAttachmentCursor(cursor)
     const cursorCond = parsed
       ? or(
-        lt(attachments.createdAt, parsed.at),
-        and(
-          eq(attachments.createdAt, parsed.at),
-          lt(attachments.id, parsed.id),
-        ),
-      )
+          lt(attachments.createdAt, parsed.at),
+          and(
+            eq(attachments.createdAt, parsed.at),
+            lt(attachments.id, parsed.id),
+          ),
+        )
       : undefined
 
     const whereExpr = and(
@@ -2008,15 +2923,9 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
-        userAvatar: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-        userDisplayName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userName: removedAuthorNameExpr,
+        userAvatar: removedAuthorAvatarExpr,
+        userDisplayName: removedAuthorDisplayNameExpr,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userStatus: workspaceMembers.statusText,
         userStatusEmoji: workspaceMembers.statusEmoji,
@@ -2166,15 +3075,9 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
-        userAvatar: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
-        userDisplayName: sql<
-          string | null
-        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        userName: removedAuthorNameExpr,
+        userAvatar: removedAuthorAvatarExpr,
+        userDisplayName: removedAuthorDisplayNameExpr,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userStatus: workspaceMembers.statusText,
         userStatusEmoji: workspaceMembers.statusEmoji,
@@ -2256,7 +3159,7 @@ export class MessageService {
     limit = CHANNEL_FILES_PAGE_SIZE,
   ) {
     // ... logic tương tự listAttachments nhưng thêm filter folderId
-    await Promise.resolve(); // Temporary to avoid lint error
+    await Promise.resolve() // Temporary to avoid lint error
     return { results: [], nextCursor: null, hasMore: false }
   }
 
@@ -2268,14 +3171,14 @@ export class MessageService {
     // 1. Query subscriptions join với parent messages
     const whereConditions = cursor
       ? and(
-        eq(threadSubscriptions.userId, userId),
-        eq(threadSubscriptions.workspaceId, workspaceId),
-        lt(messages.lastReplyAt, new Date(cursor)),
-      )
+          eq(threadSubscriptions.userId, userId),
+          eq(threadSubscriptions.workspaceId, workspaceId),
+          lt(messages.lastReplyAt, new Date(cursor)),
+        )
       : and(
-        eq(threadSubscriptions.userId, userId),
-        eq(threadSubscriptions.workspaceId, workspaceId),
-      )
+          eq(threadSubscriptions.userId, userId),
+          eq(threadSubscriptions.workspaceId, workspaceId),
+        )
 
     const rows = (await this.db
       .select({
@@ -2308,12 +3211,12 @@ export class MessageService {
       .where(whereConditions)
       .orderBy(desc(messages.lastReplyAt))
       .limit(PAGE_SIZE + 1)) as (MessageJoinRow & {
-        lastReadAt: Date
-        channelName: string | null
-        channelType: string | null
-        channelIsPrivate: boolean | null
-        isGroup: boolean | null
-      })[]
+      lastReadAt: Date
+      channelName: string | null
+      channelType: string | null
+      channelIsPrivate: boolean | null
+      isGroup: boolean | null
+    })[]
 
     const hasMore = rows.length > PAGE_SIZE
     const threadRows = rows.slice(0, PAGE_SIZE)
@@ -2369,18 +3272,18 @@ export class MessageService {
           isUnread: row.lastReplyAt ? row.lastReplyAt > row.lastReadAt : false,
           channel: row.channelId
             ? {
-              id: row.channelId,
-              name: row.channelName,
-              type: row.channelType,
-              isPrivate: row.channelIsPrivate,
-            }
+                id: row.channelId,
+                name: row.channelName,
+                type: row.channelType,
+                isPrivate: row.channelIsPrivate,
+              }
             : null,
           conversation: row.conversationId
             ? {
-              id: row.conversationId,
-              isGroup: row.isGroup,
-              members: conversationMembersData,
-            }
+                id: row.conversationId,
+                isGroup: row.isGroup,
+                members: conversationMembersData,
+              }
             : null,
           replies: snippetReplies,
           hasMoreReplies,
@@ -2397,6 +3300,3 @@ export class MessageService {
     }
   }
 }
-
-
-

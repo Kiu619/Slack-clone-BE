@@ -7,8 +7,11 @@ import { GoogleStrategy } from './strategies/google.strategy'
 import { GithubStrategy } from './strategies/github.strategy'
 import { JwtStrategy } from './strategies/jwt.strategy'
 import { JwtRefreshStrategy } from './strategies/jwt-refresh.strategy'
+import { WorkspaceMemberGuard } from './guards/workspace-member.guard'
+import { WorkspacePermissionsModule } from '../workspace/workspace-permissions.module'
+
 @Module({
-  imports: [PassportModule, JwtModule.register({})],
+  imports: [PassportModule, JwtModule.register({}), WorkspacePermissionsModule],
   controllers: [AuthController],
   providers: [
     AuthService,
@@ -16,6 +19,8 @@ import { JwtRefreshStrategy } from './strategies/jwt-refresh.strategy'
     GithubStrategy,
     JwtStrategy,
     JwtRefreshStrategy,
+    WorkspaceMemberGuard,
   ],
+  exports: [WorkspaceMemberGuard],
 })
 export class AuthModule {}

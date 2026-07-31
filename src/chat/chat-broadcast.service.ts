@@ -1,9 +1,17 @@
 import { Injectable, Inject, forwardRef } from '@nestjs/common'
 import { Server } from 'socket.io'
-import { UnifiedBroadcastService, EntityDomain, EntityAction, type EntitySyncPayload } from './unified-broadcast.service'
+import {
+  UnifiedBroadcastService,
+  EntityDomain,
+  EntityAction,
+  type EntitySyncPayload,
+} from './unified-broadcast.service'
 
 /** Room `channel:id` / `conversation:id`, hoặc raw channel UUID (legacy). */
-function parseChatRoom(room: string): { channelId?: string; conversationId?: string } {
+function parseChatRoom(room: string): {
+  channelId?: string
+  conversationId?: string
+} {
   if (room.startsWith('channel:')) {
     return { channelId: room.slice('channel:'.length) }
   }
@@ -30,17 +38,17 @@ export class ChatBroadcastService {
    * broadcastMessage — gửi message mới
    * Chỉ dùng Unified Sync cho toàn bộ UI
    */
-  broadcastMessage(
-    room: string,
-    message: any,
-    excludeSocketId?: string,
-  ) {
+  broadcastMessage(room: string, message: any, excludeSocketId?: string) {
     if (!this.server) return
 
-    const recipientIds = (message as any).recipientIds as string[]
-    const workspaceId = (message as any).workspaceId as string
-    const channelId = message.channelId || (room.startsWith('channel:') ? room.split(':')[1] : undefined)
-    const conversationId = message.conversationId || (room.startsWith('conversation:') ? room.split(':')[1] : undefined)
+    const recipientIds = message.recipientIds as string[]
+    const workspaceId = message.workspaceId as string
+    const channelId =
+      message.channelId ||
+      (room.startsWith('channel:') ? room.split(':')[1] : undefined)
+    const conversationId =
+      message.conversationId ||
+      (room.startsWith('conversation:') ? room.split(':')[1] : undefined)
     const threadId = message.parentId || undefined
 
     // Gửi event metadata cho tin nhắn cha (nếu là reply)
@@ -48,8 +56,8 @@ export class ChatBroadcastService {
     if (threadId) {
       this.server.to(room).emit('message:metadata-updated', {
         messageId: threadId,
-        replyCount: (message as any).parentReplyCount,
-        replyParticipantIds: (message as any).parentReplyParticipantIds,
+        replyCount: message.parentReplyCount,
+        replyParticipantIds: message.parentReplyParticipantIds,
         lastReplyAt: message.createdAt,
       })
     }
@@ -104,9 +112,9 @@ export class ChatBroadcastService {
             payload: {
               id: threadId,
               data: {
-                replyCount: (message as any).parentReplyCount,
+                replyCount: message.parentReplyCount,
                 lastReplyAt: message.createdAt,
-                replyParticipantIds: (message as any).parentReplyParticipantIds,
+                replyParticipantIds: message.parentReplyParticipantIds,
               },
               workspaceId,
               channelId,
@@ -130,6 +138,17 @@ export class ChatBroadcastService {
       emoji: string
       userId: string
       workspaceId: string
+      reactions?: Array<{
+        emoji: string
+        count: number
+        userIds: string[]
+        users: Array<{
+          id: string
+          name: string | null
+          displayName: string | null
+          avatar: string | null
+        }>
+      }>
     },
     excludeSocketId?: string,
     parentId?: string,
@@ -137,25 +156,33 @@ export class ChatBroadcastService {
   ) {
     if (!this.server) return
 
-    const channelId = room.startsWith('channel:') ? room.split(':')[1] : undefined
-    const conversationId = room.startsWith('conversation:') ? room.split(':')[1] : undefined
+    const channelId = room.startsWith('channel:')
+      ? room.split(':')[1]
+      : undefined
+    const conversationId = room.startsWith('conversation:')
+      ? room.split(':')[1]
+      : undefined
     const threadId = parentId || undefined
 
     if (data.workspaceId) {
+      const reactionData =
+        data.reactions !== undefined
+          ? { reactions: data.reactions }
+          : { reactionUpdate: data }
       this.unifiedBroadcastService.syncEntity(
         { channelId, conversationId, workspaceId: data.workspaceId, threadId },
         {
           domain: EntityDomain.CHAT,
           action: EntityAction.UPDATE,
-          payload: { 
-            id: data.messageId, 
-            data: { reactionUpdate: data }, 
-            workspaceId: data.workspaceId, 
-            channelId, 
-            conversationId 
-          }
+          payload: {
+            id: data.messageId,
+            data: reactionData,
+            workspaceId: data.workspaceId,
+            channelId,
+            conversationId,
+          },
         },
-        excludeSocketId
+        excludeSocketId,
       )
 
       // Sync tới người tham gia thread
@@ -166,9 +193,15 @@ export class ChatBroadcastService {
             {
               domain: EntityDomain.CHAT,
               action: EntityAction.UPDATE,
-              payload: { id: data.messageId, workspaceId: data.workspaceId, channelId, conversationId }
+              payload: {
+                id: data.messageId,
+                data: reactionData,
+                workspaceId: data.workspaceId,
+                channelId,
+                conversationId,
+              },
             },
-            excludeSocketId
+            excludeSocketId,
           )
         })
       }
@@ -187,8 +220,12 @@ export class ChatBroadcastService {
   ) {
     if (!this.server) return
 
-    const channelId = room.startsWith('channel:') ? room.split(':')[1] : undefined
-    const conversationId = room.startsWith('conversation:') ? room.split(':')[1] : undefined
+    const channelId = room.startsWith('channel:')
+      ? room.split(':')[1]
+      : undefined
+    const conversationId = room.startsWith('conversation:')
+      ? room.split(':')[1]
+      : undefined
     const threadId = updated.parentId || undefined
 
     if (workspaceId) {
@@ -197,9 +234,15 @@ export class ChatBroadcastService {
         {
           domain: EntityDomain.CHAT,
           action: EntityAction.UPDATE,
-          payload: { id: updated.id, data: updated, workspaceId, channelId, conversationId }
+          payload: {
+            id: updated.id,
+            data: updated,
+            workspaceId,
+            channelId,
+            conversationId,
+          },
         },
-        excludeSocketId
+        excludeSocketId,
       )
 
       if (recipientIds && recipientIds.length > 0) {
@@ -209,9 +252,15 @@ export class ChatBroadcastService {
             {
               domain: EntityDomain.CHAT,
               action: EntityAction.UPDATE,
-              payload: { id: updated.id, data: updated, workspaceId, channelId, conversationId }
+              payload: {
+                id: updated.id,
+                data: updated,
+                workspaceId,
+                channelId,
+                conversationId,
+              },
             },
-            excludeSocketId
+            excludeSocketId,
           )
         })
       }
@@ -233,8 +282,12 @@ export class ChatBroadcastService {
   ) {
     if (!this.server) return
 
-    const channelId = room.startsWith('channel:') ? room.split(':')[1] : undefined
-    const conversationId = room.startsWith('conversation:') ? room.split(':')[1] : undefined
+    const channelId = room.startsWith('channel:')
+      ? room.split(':')[1]
+      : undefined
+    const conversationId = room.startsWith('conversation:')
+      ? room.split(':')[1]
+      : undefined
     const threadId = parentId || undefined
 
     const deletePayload = {
@@ -242,9 +295,7 @@ export class ChatBroadcastService {
       workspaceId,
       channelId,
       conversationId,
-      ...(transferredToConversationId
-        ? { transferredToConversationId }
-        : {}),
+      ...(transferredToConversationId ? { transferredToConversationId } : {}),
     }
 
     if (workspaceId) {
@@ -408,7 +459,10 @@ export class ChatBroadcastService {
   broadcastFoldersSync(
     target: { channelId?: string; conversationId?: string },
     workspaceId: string,
-    meta: { folderAction: 'created' | 'updated' | 'deleted' | 'attachments'; folderId?: string },
+    meta: {
+      folderAction: 'created' | 'updated' | 'deleted' | 'attachments'
+      folderId?: string
+    },
     excludeSocketId?: string,
   ) {
     const { channelId, conversationId } = target
@@ -436,9 +490,15 @@ export class ChatBroadcastService {
     )
   }
 
-  broadcastNotification(userId: string, workspaceId: string, notification: any) {
+  broadcastNotification(
+    userId: string,
+    workspaceId: string,
+    notification: any,
+  ) {
     if (!this.server) return
-    this.server.to(`user:${workspaceId}:${userId}`).emit('notification:new', notification)
+    this.server
+      .to(`user:${workspaceId}:${userId}`)
+      .emit('notification:new', notification)
   }
 
   broadcastToUser(

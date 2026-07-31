@@ -152,10 +152,7 @@ export class RecentService {
         .from(conversationMembers)
         .innerJoin(
           directMessageConversations,
-          eq(
-            directMessageConversations.id,
-            conversationMembers.conversationId,
-          ),
+          eq(directMessageConversations.id, conversationMembers.conversationId),
         )
         .where(
           and(

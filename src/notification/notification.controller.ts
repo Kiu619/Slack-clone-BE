@@ -8,7 +8,8 @@ import {
   Request,
   Patch,
   Body,
-  UsePipes,
+  Headers,
+  Delete,
 } from '@nestjs/common'
 import { NotificationService } from './notification.service'
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
@@ -55,6 +56,11 @@ export class NotificationController {
     return this.notificationService.markAsRead(id, req.user.id)
   }
 
+  @Delete(':id')
+  async clearNotification(@Request() req, @Param('id') id: string) {
+    return this.notificationService.clearNotification(id, req.user.id)
+  }
+
   @Post('read-all')
   async markAllAsRead(
     @Request() req,
@@ -66,11 +72,11 @@ export class NotificationController {
   // ─── Settings Endpoints ───
 
   @Patch('settings/global')
-  @UsePipes(new ZodValidationPipe(UpdateGlobalSettingsSchema))
   async updateGlobalSettings(
     @Request() req,
     @Query('workspaceId') workspaceId: string,
-    @Body() dto: UpdateGlobalSettingsDto,
+    @Body(new ZodValidationPipe(UpdateGlobalSettingsSchema))
+    dto: UpdateGlobalSettingsDto,
   ) {
     return this.notificationService.updateGlobalSettings(
       req.user.id,
@@ -80,16 +86,33 @@ export class NotificationController {
   }
 
   @Patch('settings/override')
-  @UsePipes(new ZodValidationPipe(UpdateChannelOverrideSchema))
   async updateChannelOverride(
     @Request() req,
     @Query('workspaceId') workspaceId: string,
-    @Body() dto: UpdateChannelOverrideDto,
+    @Body(new ZodValidationPipe(UpdateChannelOverrideSchema))
+    dto: UpdateChannelOverrideDto,
+    @Headers('x-socket-id') socketId?: string,
   ) {
     return this.notificationService.updateChannelOverride(
       req.user.id,
       workspaceId,
       dto,
+      socketId,
+    )
+  }
+
+  @Get('settings/override')
+  async getChannelOverride(
+    @Request() req,
+    @Query('workspaceId') workspaceId: string,
+    @Query('channelId') channelId?: string,
+    @Query('conversationId') conversationId?: string,
+  ) {
+    return this.notificationService.getEffectiveNotificationSetting(
+      req.user.id,
+      workspaceId,
+      channelId,
+      conversationId,
     )
   }
 

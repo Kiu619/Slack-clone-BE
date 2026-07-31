@@ -13,9 +13,12 @@ import {
   Query,
   Req,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common'
 import type { Request } from 'express'
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
+import { Idempotent } from '../auth/decorators/idempotent.decorator'
+import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor'
 import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe'
 import { DirectMessageService } from './direct-message.service'
 import {
@@ -33,11 +36,13 @@ import {
 
 @Controller('workspaces/:workspaceId/direct-messages')
 @UseGuards(JwtAuthGuard)
+@UseInterceptors(IdempotencyInterceptor)
 export class DirectMessageController {
   constructor(private readonly directMessageService: DirectMessageService) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
+  @Idempotent(60)
   async getOrCreateConversation(
     @Param('workspaceId') workspaceId: string,
     @Body(new ZodValidationPipe(CreateDirectMessageSchema))

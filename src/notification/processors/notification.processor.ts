@@ -6,6 +6,7 @@ import type { DrizzleDB } from '../../database/database.module'
 import { DRIZZLE } from '../../database/database.module'
 import * as schema from '../../database/schema'
 import { ChatBroadcastService } from '../../chat/chat-broadcast.service'
+import { WorkspacePresenceService } from '../../chat/workspace-presence.service'
 
 @Processor('notification')
 export class NotificationProcessor extends WorkerHost {
@@ -14,12 +15,13 @@ export class NotificationProcessor extends WorkerHost {
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly broadcastService: ChatBroadcastService,
+    private readonly workspacePresenceService: WorkspacePresenceService,
   ) {
     super()
   }
 
   async process(job: Job<any, any, string>): Promise<any> {
-    this.logger.log(`Processing job ${job.id} of type ${job.name}`);
+    this.logger.log(`Processing job ${job.id} of type ${job.name}`)
     switch (job.name) {
       case 'notify-channel':
         return this.handleNotifyChannel(job.data)
@@ -28,13 +30,14 @@ export class NotificationProcessor extends WorkerHost {
     }
   }
 
-  private async handleNotifyChannel(data: {
+  async handleNotifyChannel(data: {
     messageId: string
     senderId: string
     workspaceId: string
     channelId?: string
     conversationId?: string
     content: string
+    parentId?: string | null
   }) {
     const {
       messageId,
@@ -43,6 +46,7 @@ export class NotificationProcessor extends WorkerHost {
       channelId,
       conversationId,
       content,
+      parentId,
     } = data
 
     // 1. Parse mentions từ content
@@ -94,14 +98,37 @@ export class NotificationProcessor extends WorkerHost {
           channelId
             ? eq(schema.channelNotificationOverrides.channelId, channelId)
             : eq(
-              schema.channelNotificationOverrides.conversationId,
-              conversationId!,
-            ),
+                schema.channelNotificationOverrides.conversationId,
+                conversationId!,
+              ),
         ),
       },
     )
 
     const overrideMap = new Map(overrides.map((o) => [o.userId, o]))
+    const socketConnectedUserIds = new Set(
+      this.workspacePresenceService.getConnectedUserIds(workspaceId, memberIds),
+    )
+    const hereEligibleUserIds = new Set(
+      membersSettings
+        .filter(
+          (member) =>
+            socketConnectedUserIds.has(member.userId) && !member.isAway,
+        )
+        .map((member) => member.userId),
+    )
+    const threadReplyRecipientIds = parentId
+      ? new Set(
+          (
+            await this.db
+              .select({ userId: schema.threadSubscriptions.userId })
+              .from(schema.threadSubscriptions)
+              .where(eq(schema.threadSubscriptions.parentMessageId, parentId))
+          )
+            .map((row) => row.userId)
+            .filter((userId) => userId !== senderId),
+        )
+      : null
 
     // 4. Lọc những người cần notify
     const notificationsToInsert: any[] = []
@@ -117,10 +144,23 @@ export class NotificationProcessor extends WorkerHost {
         !!conversationId,
       )
 
-      const { shouldCreateRecord } = this.shouldNotify(
+      if (conversationId && mentionType === 'none') {
+        continue
+      }
+
+      if (mentionType === 'here' && !hereEligibleUserIds.has(member.userId)) {
+        continue
+      }
+
+      if (threadReplyRecipientIds?.has(member.userId)) {
+        continue
+      }
+
+      const { shouldCreateRecord, type } = this.shouldNotify(
         member,
         userOverride,
         mentionType,
+        !!channelId,
       )
 
       if (shouldCreateRecord) {
@@ -128,7 +168,7 @@ export class NotificationProcessor extends WorkerHost {
           userId: member.userId,
           workspaceId,
           actorId: senderId,
-          type: this.getNotificationType(mentionType),
+          type,
           messageId,
           channelId,
           conversationId,
@@ -194,15 +234,17 @@ export class NotificationProcessor extends WorkerHost {
     while ((match = userRegex.exec(content)) !== null) {
       if (match[1]) {
         // Tránh duplicate nếu đã parse từ Tiptap HTML
-        if (!mentions.some(m => m.id === match![1])) {
+        if (!mentions.some((m) => m.id === match![1])) {
           mentions.push({ type: 'user', id: match[1] })
         }
       }
     }
 
     // 3. Special mentions: <!here>, <!channel> hoặc data-id="here/channel"
-    if (content.includes('<!here>') || content.includes('data-id="here"')) mentions.push({ type: 'here' })
-    if (content.includes('<!channel>') || content.includes('data-id="channel"')) mentions.push({ type: 'channel' })
+    if (content.includes('<!here>') || content.includes('data-id="here"'))
+      mentions.push({ type: 'here' })
+    if (content.includes('<!channel>') || content.includes('data-id="channel"'))
+      mentions.push({ type: 'channel' })
 
     return mentions
   }
@@ -213,39 +255,52 @@ export class NotificationProcessor extends WorkerHost {
     hasHere: boolean,
     hasChannel: boolean,
     isDm: boolean,
-  ): 'direct' | 'here' | 'channel' | 'dm' | 'none' {
-    if (isDm) return 'dm'
+  ): 'direct' | 'here' | 'channel' | 'none' {
+    if (isDm && directIds.includes(userId)) return 'direct'
     if (directIds.includes(userId)) return 'direct'
     if (hasChannel) return 'channel'
     if (hasHere) return 'here'
     return 'none'
   }
 
-  private shouldNotify(member: any, override: any, mentionType: string) {
+  private shouldNotify(
+    member: any,
+    override: any,
+    mentionType: string,
+    isChannel: boolean,
+  ): { shouldCreateRecord: boolean; type: 'mention' | 'post' } {
     // Mute
-    if (override?.muteChannel) return { shouldCreateRecord: false }
+    if (override?.muteChannel)
+      return { shouldCreateRecord: false, type: 'mention' }
     if (override?.mutedUntil && new Date(override.mutedUntil) > new Date())
-      return { shouldCreateRecord: false }
+      return { shouldCreateRecord: false, type: 'mention' }
 
     const notifyFor =
       override?.notifyFor ?? member.notifyFor ?? 'mentions_and_dm'
-    if (notifyFor === 'nothing') return { shouldCreateRecord: false }
+    if (notifyFor === 'nothing')
+      return { shouldCreateRecord: false, type: 'mention' }
 
-    if (notifyFor === 'all_messages') return { shouldCreateRecord: true }
+    if (notifyFor === 'all_messages') {
+      return {
+        shouldCreateRecord: true,
+        type: isChannel ? 'post' : 'mention',
+      }
+    }
 
     // mentions_and_dm
-    if (['direct', 'dm'].includes(mentionType))
-      return { shouldCreateRecord: true }
+    if (mentionType === 'direct')
+      return { shouldCreateRecord: true, type: 'mention' }
     if (mentionType === 'here')
-      return { shouldCreateRecord: member.notifyOnHereMention }
+      return {
+        shouldCreateRecord: member.notifyOnHereMention,
+        type: 'mention',
+      }
     if (mentionType === 'channel')
-      return { shouldCreateRecord: member.notifyOnChannelMention }
+      return {
+        shouldCreateRecord: member.notifyOnChannelMention,
+        type: 'mention',
+      }
 
-    return { shouldCreateRecord: false }
-  }
-
-  private getNotificationType(mentionType: string): 'mention' | 'dm' | 'reply' {
-    if (mentionType === 'dm') return 'dm'
-    return 'mention' // Mặc định cho direct/here/channel trong ngữ cảnh này
+    return { shouldCreateRecord: false, type: 'mention' }
   }
 }

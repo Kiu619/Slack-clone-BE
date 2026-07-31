@@ -6,6 +6,7 @@ import {
   ConflictException,
 } from '@nestjs/common'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
+import { AttachmentService } from '../attachment/attachment.service'
 import { MessageService } from '../message/message.service'
 import { ChatBroadcastService } from '../chat/chat-broadcast.service'
 import { UnifiedBroadcastService } from '../chat/unified-broadcast.service'
@@ -20,32 +21,66 @@ import {
   channelNotificationOverrides,
   notifications,
   type DirectMessageConversation,
+  Message,
 } from '../database/schema'
-import { and, eq, inArray, sql, desc, or, ilike, asc, isNull } from 'drizzle-orm'
+import {
+  and,
+  eq,
+  inArray,
+  sql,
+  desc,
+  or,
+  ilike,
+  asc,
+  isNull,
+  gt,
+  ne,
+} from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import type { CreateDirectMessageDto } from './dto/direct-message.dto'
 import type { UpdateConversationDto } from './dto/update-conversation.dto'
 
 const DM_MERGE_BROADCAST_CHUNK_SIZE = 40
 
+type DmConversationMember = {
+  id: string
+  name: string | null
+  avatar: string | null
+  displayName: string | null
+  email: string
+  membershipStatus: 'active' | 'deactivated'
+  isAway: boolean | null
+  status: string | null
+  statusText: string | null
+  statusEmoji: string | null
+}
+
 export interface ConversationWithMetadata extends DirectMessageConversation {
-  members: any[]
+  members: DmConversationMember[]
   lastMessageUser: {
     id: string
     name: string | null
     displayName: string | null
   } | null
   starredAt: Date | null
+  lastReadAt: Date | null
+  unreadCount: number
+  isArchivedBecausePeerDeactivated?: boolean
 }
 
-type DMTransaction = Parameters<
-  Parameters<DrizzleDB['transaction']>[0]
->[0]
+type DMTransaction = Parameters<Parameters<DrizzleDB['transaction']>[0]>[0]
+
+type ConversationReadState = {
+  conversationId: string
+  lastReadAt: Date
+  unreadCount: number
+}
 
 @Injectable()
 export class DirectMessageService {
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
+    private readonly attachmentService: AttachmentService,
     private readonly messageService: MessageService,
     private readonly chatBroadcastService: ChatBroadcastService,
     private readonly unifiedBroadcastService: UnifiedBroadcastService,
@@ -143,11 +178,50 @@ export class DirectMessageService {
     const timelineRoots = await tx
       .select({ id: messages.id })
       .from(messages)
-      .where(
-        and(eq(messages.conversationId, sourceId), timelineRootCondition),
-      )
+      .where(and(eq(messages.conversationId, sourceId), timelineRootCondition))
 
     const timelineRootIds = timelineRoots.map((r) => r.id)
+
+    const sourceMessageIdsToDelete = timelineRootIds.length
+      ? [
+          ...(
+            await tx
+              .select({ id: messages.id })
+              .from(messages)
+              .where(
+                and(
+                  eq(messages.conversationId, sourceId),
+                  inArray(messages.parentId, timelineRootIds),
+                ),
+              )
+          ).map((r) => r.id),
+          ...timelineRootIds,
+        ]
+      : []
+
+    if (sourceMessageIdsToDelete.length > 0) {
+      const attachmentsToDelete = (await tx
+        .select({
+          id: attachments.id,
+          url: attachments.url,
+          type: attachments.type,
+        })
+        .from(attachments)
+        .where(
+          inArray(attachments.messageId, sourceMessageIdsToDelete),
+        )) as Array<{
+        id: string
+        url: string
+        type: string
+      }>
+
+      if (attachmentsToDelete.length > 0) {
+        await this.attachmentService.deleteAttachmentStorageBatch(
+          attachmentsToDelete,
+        )
+      }
+    }
+
     if (timelineRootIds.length > 0) {
       await tx
         .delete(messages)
@@ -269,6 +343,59 @@ export class DirectMessageService {
     return rows.map((r) => r.userId)
   }
 
+  private async getConversationReadStates(
+    workspaceId: string,
+    userId: string,
+    conversationIds: string[],
+  ): Promise<Map<string, ConversationReadState>> {
+    if (conversationIds.length === 0) {
+      return new Map()
+    }
+
+    const rows = await this.db
+      .select({
+        conversationId: conversationMembers.conversationId,
+        lastReadAt: conversationMembers.lastReadAt,
+        unreadCount: sql<number>`count(${messages.id})::int`,
+      })
+      .from(conversationMembers)
+      .innerJoin(
+        directMessageConversations,
+        eq(directMessageConversations.id, conversationMembers.conversationId),
+      )
+      .leftJoin(
+        messages,
+        and(
+          eq(messages.conversationId, directMessageConversations.id),
+          gt(messages.createdAt, conversationMembers.lastReadAt),
+          ne(messages.userId, userId),
+          isNull(messages.deletedAt),
+        ),
+      )
+      .where(
+        and(
+          eq(conversationMembers.userId, userId),
+          eq(directMessageConversations.workspaceId, workspaceId),
+          inArray(conversationMembers.conversationId, conversationIds),
+        ),
+      )
+      .groupBy(
+        conversationMembers.conversationId,
+        conversationMembers.lastReadAt,
+      )
+
+    return new Map(
+      rows.map((row) => [
+        row.conversationId,
+        {
+          conversationId: row.conversationId,
+          lastReadAt: row.lastReadAt,
+          unreadCount: Number(row.unreadCount ?? 0),
+        },
+      ]),
+    )
+  }
+
   /**
    * Sau merge DB: stub DM cũ, timeline DM mới, invalidate cache, broadcast từng tin theo chunk.
    */
@@ -299,9 +426,12 @@ export class DirectMessageService {
 
     for (let i = 0; i < movedIds.length; i += DM_MERGE_BROADCAST_CHUNK_SIZE) {
       const chunk = movedIds.slice(i, i + DM_MERGE_BROADCAST_CHUNK_SIZE)
-      const byId = await this.messageService.getMessagesByIds(chunk, requesterId)
+      const byId = await this.messageService.getMessagesByIds(
+        chunk,
+        requesterId,
+      )
       for (const mid of chunk) {
-        const m = byId.get(mid)
+        const m = byId.get(mid) as Message
         if (!m) continue
         const payload = {
           ...m,
@@ -366,6 +496,7 @@ export class DirectMessageService {
       .where(
         and(
           eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.membershipStatus, 'active'),
           inArray(workspaceMembers.userId, allUserIds),
         ),
       )
@@ -459,14 +590,17 @@ export class DirectMessageService {
         id: users.id,
         name: sql<
           string | null
-        >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
         avatar: sql<
           string | null
         >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
         displayName: sql<
           string | null
-        >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
         email: users.email,
+        membershipStatus: sql<
+          'active' | 'deactivated'
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated' ELSE ${workspaceMembers.membershipStatus} END`,
         isAway: workspaceMembers.isAway,
         status: workspaceMembers.statusText,
         statusText: workspaceMembers.statusText,
@@ -528,11 +662,26 @@ export class DirectMessageService {
       )
       .limit(1)
 
+    const readState = await this.getConversationReadStates(
+      conversation.workspaceId,
+      currentUserId,
+      [conversationId],
+    )
+
+    const otherMembers = members.filter((m) => m.id !== currentUserId)
+    const isArchivedBecausePeerDeactivated =
+      !conversation.isGroup &&
+      otherMembers.length === 1 &&
+      otherMembers[0]?.membershipStatus !== 'active'
+
     return {
       ...conversation,
       members,
       lastMessageUser,
       starredAt: selfMembership?.starredAt ?? null,
+      lastReadAt: readState.get(conversationId)?.lastReadAt ?? null,
+      unreadCount: readState.get(conversationId)?.unreadCount ?? 0,
+      isArchivedBecausePeerDeactivated,
     }
   }
 
@@ -579,13 +728,21 @@ export class DirectMessageService {
       starRows.map((r) => [r.conversationId, r.starredAt]),
     )
 
+    const readStateByConversationId = await this.getConversationReadStates(
+      workspaceId,
+      userId,
+      ids,
+    )
+
     // Lấy full data cho các conversation này, bao gồm cả các members khác
     const conversationsQuery = this.db
       .select()
       .from(directMessageConversations)
       .where(inArray(directMessageConversations.id, ids))
 
-    const conversations = await conversationsQuery.orderBy(desc(directMessageConversations.lastMessageAt))
+    const conversations = await conversationsQuery.orderBy(
+      desc(directMessageConversations.lastMessageAt),
+    )
 
     // Với mỗi conversation, lấy thông tin thành viên
     const result = await Promise.all(
@@ -595,14 +752,17 @@ export class DirectMessageService {
             id: users.id,
             name: sql<
               string | null
-            >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
             avatar: sql<
               string | null
             >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
             displayName: sql<
               string | null
-            >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
             email: users.email,
+            membershipStatus: sql<
+              'active' | 'deactivated'
+            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated' ELSE ${workspaceMembers.membershipStatus} END`,
             isAway: workspaceMembers.isAway,
             status: workspaceMembers.statusText,
             statusText: workspaceMembers.statusText,
@@ -654,15 +814,29 @@ export class DirectMessageService {
           members,
           lastMessageUser,
           starredAt: starredAtByConversationId.get(conv.id) ?? null,
+          lastReadAt:
+            readStateByConversationId.get(conv.id)?.lastReadAt ?? null,
+          unreadCount: readStateByConversationId.get(conv.id)?.unreadCount ?? 0,
+          isArchivedBecausePeerDeactivated:
+            !conv.isGroup &&
+            members.filter((m) => m.id !== userId).length === 1 &&
+            members.find((m) => m.id !== userId)?.membershipStatus !== 'active',
         }
         return conversationWithMetadata
       }),
     )
 
     // Nếu có query search, lọc kết quả dựa trên members (name, displayName, email) và lastMessageContent
+    const visibleResult = result.filter((conv) => {
+      if (conv.isGroup) return true
+      const otherMembers = conv.members.filter((m) => m.id !== userId)
+      if (otherMembers.length === 0) return true
+      return otherMembers.every((m) => m.membershipStatus === 'active')
+    })
+
     if (q && q.trim()) {
       const searchLower = q.trim().toLowerCase()
-      return result.filter((conv) => {
+      return visibleResult.filter((conv) => {
         // Search trong members (trừ bản thân nếu là 1-1)
         const memberMatch = conv.members.some((m) => {
           if (m.id === userId && !conv.isGroup) return false
@@ -682,7 +856,7 @@ export class DirectMessageService {
       })
     }
 
-    return result
+    return visibleResult
   }
 
   async updateConversation(
@@ -791,7 +965,10 @@ export class DirectMessageService {
       eq(conversationMembers.userId, workspaceMembers.userId),
     )
 
-    const whereBase = [eq(workspaceMembers.workspaceId, workspaceId)]
+    const whereBase = [
+      eq(workspaceMembers.workspaceId, workspaceId),
+      eq(workspaceMembers.membershipStatus, 'active'),
+    ]
     if (searchCond) whereBase.push(searchCond)
 
     const rowsRaw = await this.db
@@ -807,6 +984,7 @@ export class DirectMessageService {
         avatar: sql<
           string | null
         >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        membershipStatus: workspaceMembers.membershipStatus,
         isAway: workspaceMembers.isAway,
         statusEmoji: workspaceMembers.statusEmoji,
         statusText: workspaceMembers.statusText,
@@ -876,6 +1054,7 @@ export class DirectMessageService {
       .where(
         and(
           eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.membershipStatus, 'active'),
           inArray(workspaceMembers.userId, unique),
         ),
       )
@@ -886,9 +1065,7 @@ export class DirectMessageService {
       )
     }
 
-    const targetUserIds = Array.from(
-      new Set([...currentIds, ...unique]),
-    ).sort()
+    const targetUserIds = Array.from(new Set([...currentIds, ...unique])).sort()
     const mergeIntoId = await this.findConversationIdByExactMemberSet(
       workspaceId,
       targetUserIds,
@@ -953,17 +1130,18 @@ export class DirectMessageService {
     const roomLeft = 9 - currentCount
 
     if (roomLeft <= 0) {
-      return this.getConversationById(
-        conversationId,
-        requesterId,
-        workspaceId,
-      )
+      return this.getConversationById(conversationId, requesterId, workspaceId)
     }
 
     const wsRows = await this.db
       .select({ userId: workspaceMembers.userId })
       .from(workspaceMembers)
-      .where(eq(workspaceMembers.workspaceId, workspaceId))
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.membershipStatus, 'active'),
+        ),
+      )
 
     const toAdd = wsRows
       .map((r) => r.userId)
@@ -971,16 +1149,10 @@ export class DirectMessageService {
       .slice(0, roomLeft)
 
     if (toAdd.length === 0) {
-      return this.getConversationById(
-        conversationId,
-        requesterId,
-        workspaceId,
-      )
+      return this.getConversationById(conversationId, requesterId, workspaceId)
     }
 
-    const targetUserIds = Array.from(
-      new Set([...existingSet, ...toAdd]),
-    ).sort()
+    const targetUserIds = Array.from(new Set([...existingSet, ...toAdd])).sort()
     const mergeIntoId = await this.findConversationIdByExactMemberSet(
       workspaceId,
       targetUserIds,
@@ -1025,9 +1197,7 @@ export class DirectMessageService {
     return this.getConversationById(conversationId, requesterId, workspaceId)
   }
 
-  private toStarredAtIso(
-    v: Date | string | null | undefined,
-  ): string | null {
+  private toStarredAtIso(v: Date | string | null | undefined): string | null {
     if (v == null) return null
     if (v instanceof Date) return v.toISOString()
     if (typeof v === 'string') return v

@@ -1,4 +1,5 @@
 import {
+  DeleteObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -117,6 +118,7 @@ export class S3Service implements OnModuleInit {
   ): Promise<{ url: string; key: string; expiresIn: number }> {
     // Validation
     this.validateFile(fileName, fileSize)
+    this.validateAllowedExtension(fileName)
 
     // Generate unique key: slack/files/{uuid}/{sanitized-filename}
     const uuid = randomUUID()
@@ -182,6 +184,26 @@ export class S3Service implements OnModuleInit {
   }
 
   /**
+   * Delete một object trên S3 theo key.
+   * S3 delete là idempotent nên object đã mất cũng được xem là xóa thành công.
+   */
+  async deleteObject(key: string): Promise<void> {
+    try {
+      await this.s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: this.bucketName,
+          Key: key,
+        }),
+      )
+
+      this.logger.log(`Deleted object from S3: ${key}`)
+    } catch (error) {
+      this.logger.error(`Failed to delete object from S3: ${key}`, error)
+      throw error
+    }
+  }
+
+  /**
    * Chuyển tên file sang ASCII-only (fallback cho HTTP header — ISO-8859-1)
    */
   private toAsciiFilename(fileName: string): string {
@@ -200,15 +222,43 @@ export class S3Service implements OnModuleInit {
   /**
    * Kiểm tra URL có phải S3 URL của bucket này không, và trích xuất key
    */
+  private validateAllowedExtension(fileName: string): void {
+    const normalizedFileName = fileName.trim().toLowerCase()
+    const ext = normalizedFileName.match(/\.[a-z0-9]+$/)?.[0]
+    if (!ext) {
+      throw new BadRequestException('File must include a valid extension')
+    }
+
+    if (!this.ALLOWED_EXTENSIONS.includes(ext)) {
+      throw new BadRequestException(
+        `File extension ${ext} is not allowed for S3 upload`,
+      )
+    }
+  }
+
   parseS3KeyFromUrl(url: string): string | null {
-    const region = this.config.get<string>('AWS_REGION') ?? ''
-    const escapedBucket = this.bucketName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const escapedRegion = (region ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(
-      `^https://${escapedBucket}\\.s3\\.${escapedRegion}\\.amazonaws\\.com/(.+)$`,
-    )
-    const match = url.match(pattern)
-    return match ? decodeURIComponent(match[1]) : null
+    try {
+      const parsed = new URL(url)
+      const region = this.config.get<string>('AWS_REGION') ?? ''
+      const virtualHost = `${this.bucketName}.s3.${region}.amazonaws.com`
+      const pathStyle = `s3.${region}.amazonaws.com`
+      const pathname = decodeURIComponent(parsed.pathname.replace(/^\/+/, ''))
+
+      if (parsed.hostname === virtualHost) {
+        return pathname || null
+      }
+
+      if (parsed.hostname === pathStyle) {
+        const prefix = `${this.bucketName}/`
+        return pathname.startsWith(prefix)
+          ? pathname.slice(prefix.length)
+          : null
+      }
+
+      return null
+    } catch {
+      return null
+    }
   }
 
   /**

@@ -30,6 +30,15 @@ import { LaterService } from './later.service'
 export class LaterController {
   constructor(private readonly laterService: LaterService) {}
 
+  @Get('summary')
+  async getLaterSummary(
+    @Param('workspaceId') workspaceId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.laterService.getLaterSummary(userId, workspaceId)
+  }
+
   @Get()
   async getSavedItems(
     @Param('workspaceId') workspaceId: string,
@@ -54,7 +63,8 @@ export class LaterController {
   @HttpCode(HttpStatus.OK)
   async checkSavedMessages(
     @Param('workspaceId') workspaceId: string,
-    @Body(new ZodValidationPipe(CheckLaterMessagesSchema)) dto: CheckLaterMessagesDto,
+    @Body(new ZodValidationPipe(CheckLaterMessagesSchema))
+    dto: CheckLaterMessagesDto,
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
@@ -74,7 +84,7 @@ export class LaterController {
   ) {
     const { id: userId } = req.user as { id: string }
     return this.laterService.saveItem(userId, workspaceId, {
-      ...dto
+      ...dto,
     })
   }
 
@@ -107,7 +117,11 @@ export class LaterController {
     @Req() req: Request,
   ) {
     const { id: userId } = req.user as { id: string }
-    return this.laterService.removeInProgressItemsForMessage(userId, workspaceId, messageId)
+    return this.laterService.removeInProgressItemsForMessage(
+      userId,
+      workspaceId,
+      messageId,
+    )
   }
 
   @Delete(':id')
@@ -121,4 +135,3 @@ export class LaterController {
     return this.laterService.removeItem(userId, id)
   }
 }
-

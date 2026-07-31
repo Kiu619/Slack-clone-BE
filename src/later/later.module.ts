@@ -6,7 +6,11 @@ import { LaterController } from './later.controller'
 import { LaterService } from './later.service'
 
 @Module({
-  imports: [UploadModule, forwardRef(() => MessageModule), ChatModule],
+  imports: [
+    UploadModule,
+    forwardRef(() => MessageModule),
+    forwardRef(() => ChatModule),
+  ],
   controllers: [LaterController],
   providers: [LaterService],
   exports: [LaterService],

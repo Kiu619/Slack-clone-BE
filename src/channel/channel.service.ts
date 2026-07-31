@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common'
-import { and, asc, eq, ilike, isNull, ne, or, sql } from 'drizzle-orm'
+import { and, asc, eq, ilike, inArray, isNull, ne, or, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import { MessageService } from '../message/message.service'
@@ -17,6 +17,7 @@ import {
   workspaceMembers,
   users,
 } from '../database/schema'
+import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 import type { CreateChannelDto } from './dto/create-channel.dto'
 import type { UpdateChannelDto } from './dto/update-channel.dto'
 
@@ -27,6 +28,7 @@ export class ChannelService {
     private readonly messageService: MessageService,
     private readonly chatBroadcastService: ChatBroadcastService,
     private readonly unifiedBroadcastService: UnifiedBroadcastService,
+    private readonly permissionsService: WorkspacePermissionsService,
   ) {}
 
   private slugify(name: string): string {
@@ -51,7 +53,11 @@ export class ChannelService {
 
   private async assertMembership(workspaceId: string, userId: string) {
     const [member] = await this.db
-      .select({ id: workspaceMembers.id, role: workspaceMembers.role })
+      .select({
+        id: workspaceMembers.id,
+        role: workspaceMembers.role,
+        membershipStatus: workspaceMembers.membershipStatus,
+      })
       .from(workspaceMembers)
       .where(
         and(
@@ -64,11 +70,27 @@ export class ChannelService {
     if (!member) {
       throw new ForbiddenException('You are not a member of this workspace')
     }
+    if (member.membershipStatus !== 'active') {
+      throw new ForbiddenException('Your workspace membership is deactivated')
+    }
     return member
   }
 
   async create(workspaceId: string, userId: string, dto: CreateChannelDto) {
     await this.assertMembership(workspaceId, userId)
+    if (dto.isPrivate) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'create_private_channels',
+      )
+    } else {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'create_public_channels',
+      )
+    }
 
     const slug = this.slugify(dto.name)
 
@@ -125,22 +147,39 @@ export class ChannelService {
     userId: string,
     dto: UpdateChannelDto,
   ) {
-    const member = await this.assertMembership(workspaceId, userId)
+    await this.assertMembership(workspaceId, userId)
     const channel = await this.findOne(channelId, workspaceId, userId)
+    const hasSettingsUpdate = dto.postingSettings !== undefined
+    const hasPrivacyUpdate = dto.isPrivate !== undefined
+
+    if (hasSettingsUpdate) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        'edit_channel_posting_permissions',
+      )
+    }
+
+    if (hasPrivacyUpdate && dto.isPrivate !== channel.isPrivate) {
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        userId,
+        dto.isPrivate
+          ? 'convert_public_channels_to_private'
+          : 'convert_private_channels_to_public',
+      )
+    }
 
     const patch: {
       name?: string
       slug?: string
       topic?: string | null
       description?: string | null
+      postingSettings?: UpdateChannelDto['postingSettings']
+      isPrivate?: boolean
     } = {}
 
     if (dto.name !== undefined) {
-      if (member.role === 'member') {
-        throw new ForbiddenException(
-          'Only admins and owners can rename channels',
-        )
-      }
       const slug = this.slugify(dto.name)
       const [slugConflict] = await this.db
         .select({ id: channels.id })
@@ -168,6 +207,26 @@ export class ChannelService {
     if (dto.description !== undefined) {
       patch.description = dto.description
     }
+    if (dto.isPrivate !== undefined) {
+      patch.isPrivate = dto.isPrivate
+    }
+    if (dto.postingSettings !== undefined) {
+      if (dto.postingSettings === null) {
+        patch.postingSettings = null
+      } else {
+        const normalizedSpecificUserIds =
+          dto.postingSettings.mode === 'admins_plus_specific_people'
+            ? Array.from(new Set(dto.postingSettings.specificUserIds))
+            : []
+
+        patch.postingSettings = {
+          mode: dto.postingSettings.mode,
+          allowThreads: dto.postingSettings.allowThreads,
+          allowMentions: dto.postingSettings.allowMentions,
+          specificUserIds: normalizedSpecificUserIds,
+        }
+      }
+    }
 
     if (Object.keys(patch).length === 0) {
       return channel
@@ -190,6 +249,12 @@ export class ChannelService {
     const descriptionChanged =
       dto.description !== undefined &&
       norm(channel.description) !== norm(result.description)
+    const postingSettingsChanged =
+      dto.postingSettings !== undefined &&
+      JSON.stringify(channel.postingSettings ?? null) !==
+        JSON.stringify(result.postingSettings ?? null)
+    const privacyChanged =
+      dto.isPrivate !== undefined && channel.isPrivate !== result.isPrivate
 
     const room = `channel:${channelId}`
     if (topicChanged) {
@@ -210,12 +275,68 @@ export class ChannelService {
       )
       this.chatBroadcastService.broadcastMessage(room, m, undefined)
     }
+    if (postingSettingsChanged) {
+      const m = await this.messageService.createTimelineTextMessage(
+        { channelId },
+        userId,
+        'channel_posting_permissions',
+      )
+      this.chatBroadcastService.broadcastMessage(room, m, undefined)
+    }
+    if (privacyChanged) {
+      const m = await this.messageService.createTimelineTextMessage(
+        { channelId },
+        userId,
+        'channel_privacy',
+        result.isPrivate ? 'private' : 'public',
+      )
+      this.chatBroadcastService.broadcastMessage(room, m, undefined)
+    }
 
     return { ...result, starredAt: keepStarredAt }
   }
 
-  async findAllByWorkspace(workspaceId: string, userId: string) {
+  async findAllByWorkspace(
+    workspaceId: string,
+    userId: string,
+    withUserIds: string[] = [],
+  ) {
     await this.assertMembership(workspaceId, userId)
+
+    const normalizedWithUserIds = Array.from(
+      new Set(
+        withUserIds
+          .map((id) => id.trim())
+          .filter((id) => id.length > 0 && id !== userId),
+      ),
+    )
+    const requiredUserIds =
+      normalizedWithUserIds.length > 0
+        ? [userId, ...normalizedWithUserIds]
+        : [userId]
+
+    let requiredChannelIds: string[] | null = null
+    if (normalizedWithUserIds.length > 0) {
+      const matchingRows = await this.db
+        .select({ channelId: channelMembers.channelId })
+        .from(channelMembers)
+        .innerJoin(channels, eq(channelMembers.channelId, channels.id))
+        .where(
+          and(
+            eq(channels.workspaceId, workspaceId),
+            inArray(channelMembers.userId, requiredUserIds),
+          ),
+        )
+        .groupBy(channelMembers.channelId)
+        .having(
+          sql`count(distinct ${channelMembers.userId}) = ${requiredUserIds.length}`,
+        )
+
+      requiredChannelIds = matchingRows.map((row) => row.channelId)
+      if (requiredChannelIds.length === 0) {
+        return []
+      }
+    }
 
     const rows = await this.db
       .select({
@@ -228,6 +349,9 @@ export class ChannelService {
         and(
           eq(channels.workspaceId, workspaceId),
           eq(channelMembers.userId, userId),
+          requiredChannelIds
+            ? inArray(channels.id, requiredChannelIds)
+            : sql`true`,
         ),
       )
 
@@ -319,11 +443,12 @@ export class ChannelService {
   }
 
   async delete(channelId: string, workspaceId: string, userId: string) {
-    const member = await this.assertMembership(workspaceId, userId)
-
-    if (member.role === 'member') {
-      throw new ForbiddenException('Only admins and owners can delete channels')
-    }
+    await this.assertMembership(workspaceId, userId)
+    await this.permissionsService.requireUserPermission(
+      workspaceId,
+      userId,
+      'delete_channels',
+    )
 
     const [channel] = await this.db
       .select({ id: channels.id, isDefaultChannel: channels.isDefaultChannel })
@@ -512,6 +637,11 @@ export class ChannelService {
     targetUserId: string,
   ) {
     await this.findOne(channelId, workspaceId, requesterId)
+    await this.permissionsService.requireUserPermission(
+      workspaceId,
+      requesterId,
+      'manage_user_permissions',
+    )
 
     const [targetWs] = await this.db
       .select({ id: workspaceMembers.id })
@@ -562,9 +692,17 @@ export class ChannelService {
     requesterId: string,
   ): Promise<{ added: number; addedUserIds: string[] }> {
     await this.findOne(channelId, workspaceId, requesterId)
+    await this.permissionsService.requireUserPermission(
+      workspaceId,
+      requesterId,
+      'manage_user_permissions',
+    )
 
     const [ch] = await this.db
-      .select({ isDefaultChannel: channels.isDefaultChannel })
+      .select({
+        isDefaultChannel: channels.isDefaultChannel,
+        isPrivate: channels.isPrivate,
+      })
       .from(channels)
       .where(
         and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
@@ -616,11 +754,12 @@ export class ChannelService {
     requesterId: string,
     targetUserId: string,
   ) {
-    const member = await this.assertMembership(workspaceId, requesterId)
+    await this.assertMembership(workspaceId, requesterId)
 
     const [ch] = await this.db
       .select({
         isDefaultChannel: channels.isDefaultChannel,
+        isPrivate: channels.isPrivate,
       })
       .from(channels)
       .where(
@@ -638,11 +777,13 @@ export class ChannelService {
     await this.findOne(channelId, workspaceId, requesterId)
 
     if (targetUserId !== requesterId) {
-      if (member.role === 'member') {
-        throw new ForbiddenException(
-          'Only workspace admins and owners can remove other members',
-        )
-      }
+      await this.permissionsService.requireUserPermission(
+        workspaceId,
+        requesterId,
+        ch.isPrivate
+          ? 'remove_users_from_private_channels'
+          : 'remove_users_from_public_channels',
+      )
     }
 
     const [row] = await this.db
@@ -662,9 +803,7 @@ export class ChannelService {
     return { ok: true as const }
   }
 
-  private toStarredAtIso(
-    v: Date | string | null | undefined,
-  ): string | null {
+  private toStarredAtIso(v: Date | string | null | undefined): string | null {
     if (v == null) return null
     if (v instanceof Date) return v.toISOString()
     if (typeof v === 'string') return v

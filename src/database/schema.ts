@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
-import { relations } from 'drizzle-orm'
+import { relations, sql } from 'drizzle-orm'
+import type { HuddleMessageSnapshot } from '../huddle/huddle.types'
 import {
   boolean,
   doublePrecision,
@@ -17,6 +18,17 @@ export const channelTypeEnum = pgEnum('channel_type', [
   'text',
   'audio',
   'video',
+])
+
+export const huddleEntityTypeEnum = pgEnum('huddle_entity_type', [
+  'channel',
+  'dm',
+])
+
+export const huddleSessionStatusEnum = pgEnum('huddle_session_status', [
+  'pending',
+  'active',
+  'ended',
 ])
 
 /** Tài khoản: email + default hiển thị (OAuth) khi seed workspace_members */
@@ -90,9 +102,14 @@ export const workspaceMembers = pgTable(
     userId: text('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
-    role: text('role', { enum: ['owner', 'admin', 'member'] })
+    role: text('role', { enum: ['member', 'admin', 'owner', 'primary_owner'] })
       .notNull()
       .default('member'),
+    membershipStatus: text('membership_status', {
+      enum: ['active', 'deactivated'],
+    })
+      .notNull()
+      .default('active'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
     /** Profile trong workspace (Slack-style) */
     email: text('email'), // Lưu email để hiển thị profile nhanh hơn không cần join users
@@ -116,7 +133,9 @@ export const workspaceMembers = pgTable(
     })
       .notNull()
       .default('mentions_and_dm'),
-    notifyOnHereMention: boolean('notify_on_here_mention').notNull().default(true),
+    notifyOnHereMention: boolean('notify_on_here_mention')
+      .notNull()
+      .default(true),
     notifyOnChannelMention: boolean('notify_on_channel_mention')
       .notNull()
       .default(true),
@@ -132,6 +151,97 @@ export const workspaceMembers = pgTable(
     uniqueIndex('workspace_members_unique').on(table.workspaceId, table.userId),
     index('workspace_members_workspace_idx').on(table.workspaceId),
     index('workspace_members_user_idx').on(table.userId),
+  ],
+)
+
+export const workspacePermissions = pgTable(
+  'workspace_permissions',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    permissionKey: text('permission_key').notNull(),
+    memberAllowed: boolean('member_allowed').notNull().default(false),
+    adminAllowed: boolean('admin_allowed').notNull().default(false),
+    ownerAllowed: boolean('owner_allowed').notNull().default(false),
+    primaryOwnerAllowed: boolean('primary_owner_allowed')
+      .notNull()
+      .default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('workspace_permissions_workspace_permission_unique').on(
+      table.workspaceId,
+      table.permissionKey,
+    ),
+    index('workspace_permissions_workspace_idx').on(table.workspaceId),
+  ],
+)
+
+export const workspaceCustomEmojis = pgTable(
+  'workspace_custom_emojis',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    imageUrl: text('image_url').notNull(),
+    aliasOfId: text('alias_of_id'),
+    sourceDefaultEmoji: text('source_default_emoji'),
+    createdById: text('created_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('workspace_custom_emojis_workspace_name_unique').on(
+      table.workspaceId,
+      table.name,
+    ),
+    index('workspace_custom_emojis_workspace_idx').on(table.workspaceId),
+    index('workspace_custom_emojis_alias_of_idx').on(table.aliasOfId),
+    index('workspace_custom_emojis_source_default_emoji_idx').on(
+      table.sourceDefaultEmoji,
+    ),
+  ],
+)
+
+export const workspaceEmojiSettings = pgTable(
+  'workspace_emoji_settings',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    slot1Emoji: text('slot_1_emoji'),
+    slot2Emoji: text('slot_2_emoji'),
+    slot3Emoji: text('slot_3_emoji'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('workspace_emoji_settings_workspace_unique').on(
+      table.workspaceId,
+    ),
   ],
 )
 
@@ -152,6 +262,14 @@ export const channels = pgTable(
     isDefaultChannel: boolean('is_default_channel').notNull().default(false),
     topic: text('topic'),
     description: text('description'),
+    postingSettings: jsonb('posting_settings')
+      .$type<{
+        mode: 'everyone' | 'admin_only' | 'admins_plus_specific_people'
+        allowThreads: boolean
+        allowMentions: boolean
+        specificUserIds: string[]
+      } | null>()
+      .default(null),
     createdById: text('created_by_id').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -184,7 +302,7 @@ export const channelMembers = pgTable(
     userId: text('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
-    role: text('role', { enum: ['owner', 'admin', 'member'] })
+    role: text('role', { enum: ['member', 'admin', 'owner', 'primary_owner'] })
       .notNull()
       .default('member'),
     joinedAt: timestamp('joined_at').defaultNow().notNull(),
@@ -216,9 +334,7 @@ export const directMessageConversations = pgTable(
     lastMessageUserId: text('last_message_user_id').references(() => users.id, {
       onDelete: 'set null',
     }),
-    lastMessageId: text('last_message_id').references(() => messages.id, {
-      onDelete: 'set null',
-    }),
+    lastMessageId: text('last_message_id'),
     topic: text('topic'),
     description: text('description'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -255,6 +371,83 @@ export const conversationMembers = pgTable(
     ),
     index('conversation_members_conversation_idx').on(table.conversationId),
     index('conversation_members_user_idx').on(table.userId),
+  ],
+)
+
+export const huddleSessions = pgTable(
+  'huddle_sessions',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    entityType: huddleEntityTypeEnum('entity_type').notNull(),
+    entityId: text('entity_id').notNull(),
+    /** Active session marker used to guarantee only one non-ended session per entity. */
+    entityActiveKey: text('entity_active_key'),
+    roomName: text('room_name').notNull(),
+    status: huddleSessionStatusEnum('status').notNull().default('pending'),
+    startedById: text('started_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    startedAt: timestamp('started_at').defaultNow().notNull(),
+    endedAt: timestamp('ended_at'),
+    lastActivityAt: timestamp('last_activity_at').defaultNow().notNull(),
+    topic: text('topic'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('huddle_sessions_entity_active_key_unique').on(
+      table.entityActiveKey,
+    ),
+    index('huddle_sessions_workspace_idx').on(table.workspaceId),
+    index('huddle_sessions_entity_idx').on(
+      table.workspaceId,
+      table.entityType,
+      table.entityId,
+      table.startedAt,
+    ),
+    index('huddle_sessions_room_name_idx').on(table.roomName),
+  ],
+)
+
+export const huddleParticipants = pgTable(
+  'huddle_participants',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => huddleSessions.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    joinedAt: timestamp('joined_at').defaultNow().notNull(),
+    leftAt: timestamp('left_at'),
+    isMuted: boolean('is_muted').notNull().default(false),
+    isCameraOn: boolean('is_camera_on').notNull().default(false),
+    isScreenSharing: boolean('is_screen_sharing').notNull().default(false),
+    isSpeaking: boolean('is_speaking').notNull().default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('huddle_participants_session_user_unique').on(
+      table.sessionId,
+      table.userId,
+    ),
+    index('huddle_participants_session_idx').on(table.sessionId),
+    index('huddle_participants_user_idx').on(table.userId),
   ],
 )
 
@@ -296,6 +489,7 @@ export const messageTypeEnum = pgEnum('message_type', [
   'text',
   'system',
   'timeline',
+  'huddle',
 ])
 
 export const savedItemStatusEnum = pgEnum('saved_item_status', [
@@ -303,7 +497,6 @@ export const savedItemStatusEnum = pgEnum('saved_item_status', [
   'completed',
   'archived',
 ])
-
 
 export const messages = pgTable(
   'messages',
@@ -327,6 +520,8 @@ export const messages = pgTable(
     content: text('content').notNull(),
     type: messageTypeEnum('type').notNull().default('text'),
     parentId: text('parent_id'),
+    huddleSessionId: text('huddle_session_id'),
+    huddleSnapshot: jsonb('huddle_snapshot').$type<HuddleMessageSnapshot | null>(),
     alsoSendToChannel: boolean('also_send_to_channel').notNull().default(false),
     replyCount: integer('reply_count').notNull().default(0),
     lastReplyAt: timestamp('last_reply_at'),
@@ -339,7 +534,10 @@ export const messages = pgTable(
     /** false = tin do server tạo (topic/description/merge), không cho PATCH nội dung */
     allowEdit: boolean('allow_edit').notNull().default(true),
     /** Snapshot tin gốc khi message là forward (JSON) */
-    forwardSnapshot: jsonb('forward_snapshot').$type<Record<string, unknown> | null>(),
+    forwardSnapshot: jsonb('forward_snapshot').$type<Record<
+      string,
+      unknown
+    > | null>(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
@@ -347,15 +545,23 @@ export const messages = pgTable(
       .$onUpdate(() => new Date()),
   },
   (table) => [
-    index('messages_channel_idx').on(table.channelId),
-    index('messages_conversation_idx').on(table.conversationId),
     index('messages_user_idx').on(table.userId),
-    index('messages_parent_idx').on(table.parentId),
-    index('messages_channel_created_idx').on(table.channelId, table.createdAt),
-    index('messages_conversation_created_idx').on(
+    index('messages_channel_created_id_idx').on(
+      table.channelId,
+      table.createdAt,
+      table.id,
+    ),
+    index('messages_conversation_created_id_idx').on(
       table.conversationId,
       table.createdAt,
+      table.id,
     ),
+    index('messages_parent_created_id_idx').on(
+      table.parentId,
+      table.createdAt,
+      table.id,
+    ),
+    uniqueIndex('messages_huddle_session_unique').on(table.huddleSessionId),
     index('messages_workspace_idx').on(table.workspaceId),
   ],
 )
@@ -472,6 +678,12 @@ export const attachments = pgTable(
     height: integer('height'),
     /** Duration (giây) cho video/audio — dùng double vì Cloudinary trả về số thập phân */
     duration: doublePrecision('duration'),
+    previewImageUrl: text('preview_image_url'),
+    previewStatus: text('preview_status', {
+      enum: ['pending', 'ready', 'failed'],
+    }),
+    previewUpdatedAt: timestamp('preview_updated_at'),
+    previewErrorCode: text('preview_error_code'),
     /**
      * `message_body` — file user gửi / thêm khi sửa tin;
      * `forward_quote` — bản copy từ tin được forward (dùng khi mixed forward chỉ mang body).
@@ -490,9 +702,16 @@ export const attachments = pgTable(
       table.fileCategory,
     ),
     index('attachments_user_idx').on(table.userId),
-    index('attachments_channel_idx').on(table.channelId),
-    index('attachments_conversation_idx').on(table.conversationId),
-    index('attachments_created_at_idx').on(table.createdAt),
+    index('attachments_channel_created_id_idx').on(
+      table.channelId,
+      table.createdAt,
+      table.id,
+    ),
+    index('attachments_conversation_created_id_idx').on(
+      table.conversationId,
+      table.createdAt,
+      table.id,
+    ),
   ],
 )
 
@@ -707,7 +926,9 @@ export const savedItems = pgTable(
       .references(() => workspaces.id, { onDelete: 'cascade' }),
 
     /** Loại item: lưu tin nhắn hay lưu file cụ thể */
-    type: text('type', { enum: ['message', 'attachment', 'reminder'] }).notNull(),
+    type: text('type', {
+      enum: ['message', 'attachment', 'reminder'],
+    }).notNull(),
 
     // Một trong hai cái này sẽ có giá trị (hoặc không có nếu là reminder)
     messageId: text('message_id').references(() => messages.id, {
@@ -731,11 +952,20 @@ export const savedItems = pgTable(
   },
   (table) => [
     index('saved_items_user_message_idx').on(table.userId, table.messageId),
-    index('saved_items_user_attachment_idx').on(table.userId, table.attachmentId),
+    index('saved_items_user_attachment_idx').on(
+      table.userId,
+      table.attachmentId,
+    ),
     index('saved_items_user_workspace_status_idx').on(
       table.userId,
       table.workspaceId,
       table.status,
+    ),
+    index('saved_items_user_workspace_status_remind_at_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.status,
+      table.remindAt,
     ),
     index('saved_items_later_check_message_idx').on(
       table.userId,
@@ -837,8 +1067,8 @@ export const mentions = pgTable(
 
 export const notificationTypeEnum = pgEnum('notification_type', [
   'mention', // @mention trực tiếp
+  'post', // bài đăng/channel message thường
   'reply', // reply vào thread đang subscribe
-  'dm', // DM mới
   'reaction', // react vào message của mình
   'channel_invite', // được thêm vào channel
 ])
@@ -879,9 +1109,14 @@ export const notifications = pgTable(
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
   (table) => [
-    index('notifications_user_workspace_idx').on(table.userId, table.workspaceId),
-    index('notifications_user_unread_idx').on(table.userId, table.isRead),
-    index('notifications_created_at_idx').on(table.createdAt),
+    index('notifications_user_workspace_created_idx').on(
+      table.userId,
+      table.workspaceId,
+      table.createdAt,
+    ),
+    index('notifications_unread_idx')
+      .on(table.userId, table.workspaceId)
+      .where(sql`${table.isRead} = false`),
   ],
 )
 
@@ -902,8 +1137,7 @@ export const accountsRelations = relations(accounts, ({ one }) => ({
 
 export const workspacesRelations = relations(workspaces, ({ many }) => ({
   members: many(workspaceMembers),
-  channels: many(channels),
-  dmConversations: many(directMessageConversations),
+  // removed: channels, dmConversations — no call-site, breaks cycle
 }))
 
 export const workspaceMembersRelations = relations(
@@ -952,8 +1186,8 @@ export const directMessageConversationsRelations = relations(
       references: [workspaces.id],
     }),
     members: many(conversationMembers),
-    messages: many(messages),
     folders: many(channelFolders),
+    // removed: messages — no call-site, breaks cycle
   }),
 )
 
@@ -994,7 +1228,7 @@ export const messagesRelations = relations(messages, ({ one, many }) => ({
   attachments: many(attachments),
   threadSubscriptions: many(threadSubscriptions),
   mentions: many(mentions),
-  notifications: many(notifications),
+  // removed: notifications — no call-site, breaks cycle
 }))
 
 export const mentionsRelations = relations(mentions, ({ one }) => ({
@@ -1189,7 +1423,6 @@ export const savedItemsRelations = relations(savedItems, ({ one }) => ({
   }),
 }))
 
-
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type User = typeof users.$inferSelect
@@ -1199,6 +1432,7 @@ export type NewAccount = typeof accounts.$inferInsert
 export type Workspace = typeof workspaces.$inferSelect
 export type NewWorkspace = typeof workspaces.$inferInsert
 export type WorkspaceMember = typeof workspaceMembers.$inferSelect
+export type WorkspacePermission = typeof workspacePermissions.$inferSelect
 export type Channel = typeof channels.$inferSelect
 export type NewChannel = typeof channels.$inferInsert
 export type ChannelMember = typeof channelMembers.$inferSelect

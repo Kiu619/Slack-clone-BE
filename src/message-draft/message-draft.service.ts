@@ -83,11 +83,7 @@ export class MessageDraftService {
       .orderBy(desc(messageDrafts.updatedAt))
   }
 
-  async findByContext(
-    workspaceId: string,
-    userId: string,
-    contextKey: string,
-  ) {
+  async findByContext(workspaceId: string, userId: string, contextKey: string) {
     await this.assertMember(workspaceId, userId)
     this.assertContextKeyForWorkspace(workspaceId, contextKey)
     const [row] = await this.db
@@ -161,7 +157,7 @@ export class MessageDraftService {
         updatedAt: messageDrafts.updatedAt,
       })
 
-    const saved = row!
+    const saved = row
     this.broadcast(
       userId,
       workspaceId,

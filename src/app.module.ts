@@ -25,6 +25,7 @@ import { ScheduledMessageModule } from './scheduled-message/scheduled-message.mo
 import { RecentModule } from './recent/recent.module'
 import { BullModule } from '@nestjs/bullmq'
 import { NotificationModule } from './notification/notification.module'
+import { WorkspaceMemberPreferencesModule } from './workspace-member-preferences/workspace-member-preferences.module'
 import { HuddleModule } from './huddle/huddle.module'
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard'
 import { WorkspaceMemberGuard } from './auth/guards/workspace-member.guard'
@@ -82,6 +83,7 @@ import { HttpLoggerMiddleware } from './common/middleware/http-logger.middleware
     FolderModule,
     NotificationModule,
     HuddleModule,
+    WorkspaceMemberPreferencesModule,
     /**
      * ThrottlerModule — Rate Limiting cho toàn bộ REST API
      *

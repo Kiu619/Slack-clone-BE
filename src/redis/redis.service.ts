@@ -305,4 +305,74 @@ export class RedisService implements OnModuleInit {
 
     return { pubClient, subClient }
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Token blacklist — set key với TTL bằng thời gian còn lại của token.
+  // Dùng để logout có hiệu lực ngay (invalidate access + refresh tokens).
+  // ──────────────────────────────────────────────────────────────────────────
+
+  async addAccessTokenToBlacklist(
+    jti: string,
+    ttlSeconds: number,
+  ): Promise<void> {
+    if (ttlSeconds <= 0) return
+    try {
+      await this.redis.setex(`blacklist:access:${jti}`, ttlSeconds, '1')
+    } catch (error) {
+      this.logger.warn(
+        `Failed to blacklist access token (jti=${jti}): ${error}`,
+      )
+    }
+  }
+
+  async isAccessTokenBlacklisted(jti: string): Promise<boolean> {
+    try {
+      const result = await this.redis.exists(`blacklist:access:${jti}`)
+      return result === 1
+    } catch (error) {
+      this.logger.warn(
+        `Failed to check access token blacklist (jti=${jti}): ${error}`,
+      )
+      // Fail-open: nếu Redis lỗi, cho qua để không block user.
+      return false
+    }
+  }
+
+  async addRefreshTokenToBlacklist(
+    token: string,
+    ttlSeconds: number,
+  ): Promise<void> {
+    if (ttlSeconds <= 0) return
+    const key = this.refreshBlacklistKey(token)
+    try {
+      await this.redis.setex(key, ttlSeconds, '1')
+    } catch (error) {
+      this.logger.warn(
+        `Failed to blacklist refresh token: ${error}`,
+      )
+    }
+  }
+
+  async isRefreshTokenBlacklisted(token: string): Promise<boolean> {
+    const key = this.refreshBlacklistKey(token)
+    try {
+      const result = await this.redis.exists(key)
+      return result === 1
+    } catch (error) {
+      this.logger.warn(
+        `Failed to check refresh token blacklist: ${error}`,
+      )
+      return false
+    }
+  }
+
+  /**
+   * Hash refresh token bằng SHA256 để không lưu raw token trong Redis
+   * (tránh leak qua logs / redis-cli).
+   */
+  private refreshBlacklistKey(token: string): string {
+    const crypto = require('crypto') as typeof import('crypto')
+    const hash = crypto.createHash('sha256').update(token).digest('hex')
+    return `blacklist:refresh:${hash}`
+  }
 }

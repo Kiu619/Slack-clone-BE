@@ -1,4 +1,8 @@
-import { Injectable, ExecutionContext, UnauthorizedException } from '@nestjs/common'
+import {
+  Injectable,
+  ExecutionContext,
+  UnauthorizedException,
+} from '@nestjs/common'
 import { Reflector } from '@nestjs/core'
 import { AuthGuard } from '@nestjs/passport'
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator'
@@ -22,7 +26,7 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
     return super.canActivate(context)
   }
 
-  handleRequest(err: any, user: any, info: any, context: ExecutionContext, status?: any) {
+  handleRequest(err: any, user: any) {
     if (err || !user) {
       throw err || new UnauthorizedException('Invalid or expired token')
     }

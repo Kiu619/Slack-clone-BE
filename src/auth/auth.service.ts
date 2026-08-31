@@ -2,7 +2,7 @@ import { Inject, Injectable, UnauthorizedException } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 import { ConfigService } from '@nestjs/config'
 import type { Request, Response } from 'express'
-import { randomBytes } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { eq, and } from 'drizzle-orm'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import { users, accounts } from '../database/schema'
@@ -18,12 +18,31 @@ const OAUTH_REDIRECT_COOKIE_TTL_MS = 10 * 60 * 1000
 
 const SAFE_REDIRECT_MAX_LENGTH = 2048
 
+const ONE_SECOND_MS = 1000
+
 export interface OAuthUserData {
   provider: string
   providerAccountId: string
   email: string
   name?: string
   avatar?: string
+}
+
+export interface AccessTokenPayload {
+  sub: string
+  email: string
+  name?: string | null
+  avatar?: string | null
+  jti?: string
+  iat?: number
+  exp?: number
+}
+
+export interface RefreshTokenPayload {
+  sub: string
+  email: string
+  iat?: number
+  exp?: number
 }
 
 @Injectable()
@@ -189,6 +208,8 @@ export class AuthService {
   /**
    * Access token: sub, email, name, avatar — chỉ **default tài khoản** (bảng users).
    * Tên/avatar theo workspace lấy từ API workspace / messages, không nằm trong JWT.
+   *
+   * Access token mang `jti` (random UUID) để hỗ trợ blacklist khi logout.
    */
   generateTokens(
     id: string,
@@ -196,12 +217,15 @@ export class AuthService {
     name?: string | null,
     avatar?: string | null,
   ) {
+    const accessJti = randomUUID()
+
     const accessToken = this.jwt.sign(
       {
         sub: id,
         email,
         name: name ?? null,
         avatar: avatar ?? null,
+        jti: accessJti,
       },
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
@@ -220,6 +244,69 @@ export class AuthService {
     return { accessToken, refreshToken }
   }
 
+  /**
+   * Verify access token và trả payload (kèm jti/exp) — dùng cho logout
+   * để tính TTL còn lại khi blacklist.
+   * Trả null nếu token invalid/expired.
+   */
+  decodeAccessToken(token: string): AccessTokenPayload | null {
+    try {
+      return this.jwt.verify<AccessTokenPayload>(token, {
+        secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
+      })
+    } catch {
+      return null
+    }
+  }
+
+  decodeRefreshToken(token: string): RefreshTokenPayload | null {
+    try {
+      return this.jwt.verify<RefreshTokenPayload>(token, {
+        secret: this.config.getOrThrow<string>('JWT_REFRESH_SECRET'),
+      })
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Logout: blacklist cả access (theo jti) + refresh token, với TTL = thời gian
+   * còn lại của token. Best-effort: nếu Redis lỗi, log warning nhưng vẫn clear cookie.
+   */
+  async logoutUser(
+    accessToken: string | undefined,
+    refreshToken: string | undefined,
+  ): Promise<void> {
+    const tasks: Promise<void>[] = []
+
+    if (accessToken) {
+      const payload = this.decodeAccessToken(accessToken)
+      if (payload?.jti && payload.exp) {
+        const ttlSec = this.remainingTtlSeconds(payload.exp)
+        tasks.push(
+          this.redis.addAccessTokenToBlacklist(payload.jti, ttlSec),
+        )
+      }
+    }
+
+    if (refreshToken) {
+      const payload = this.decodeRefreshToken(refreshToken)
+      if (payload?.exp) {
+        const ttlSec = this.remainingTtlSeconds(payload.exp)
+        tasks.push(
+          this.redis.addRefreshTokenToBlacklist(refreshToken, ttlSec),
+        )
+      }
+    }
+
+    await Promise.all(tasks)
+  }
+
+  private remainingTtlSeconds(exp: number): number {
+    const ms = exp * ONE_SECOND_MS - Date.now()
+    return Math.max(0, Math.ceil(ms / ONE_SECOND_MS))
+  }
+
   setTokenCookies(
     res: Response,
     accessToken: string,
@@ -231,6 +318,7 @@ export class AuthService {
       httpOnly: true,
       secure: isProd,
       sameSite: isProd ? 'none' : 'lax',
+      path: '/',
       maxAge: ACCESS_TOKEN_COOKIE_TTL,
     })
 
@@ -238,14 +326,14 @@ export class AuthService {
       httpOnly: true,
       secure: isProd,
       sameSite: isProd ? 'none' : 'lax',
+      path: '/',
       maxAge: REFRESH_TOKEN_COOKIE_TTL,
-      path: '/auth/refresh',
     })
   }
 
   clearTokenCookies(res: Response): void {
-    res.clearCookie('access_token')
-    res.clearCookie('refresh_token', { path: '/auth/refresh' })
+    res.clearCookie('access_token', { path: '/' })
+    res.clearCookie('refresh_token', { path: '/' })
   }
 
   /** Hồ sơ tài khoản (không gồm profile theo workspace) */

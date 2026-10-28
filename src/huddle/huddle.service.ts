@@ -49,7 +49,7 @@ type HuddleSessionRow = typeof huddleSessions.$inferSelect
 type HuddleParticipantRow = typeof huddleParticipants.$inferSelect
 type HuddleParticipantDisplayRow = HuddleParticipantRow & {
   workspaceMemberId: string | null
-  workspaceMemberStatus: 'active' | 'deactivated' | null
+  workspaceMemberStatus: 'active' | 'deactivated' | 'deleted' | null
   workspaceMemberEmail: string | null
   workspaceMemberName: string | null
   workspaceMemberDisplayName: string | null
@@ -332,20 +332,27 @@ export class HuddleService {
     row: HuddleParticipantDisplayRow,
   ): HuddleParticipantSnapshot {
     const membershipStatus =
-      row.workspaceMemberStatus === 'active' ? 'active' : 'deactivated'
+      row.workspaceMemberStatus === 'active' ? 'active' : row.workspaceMemberStatus === 'deactivated' ? 'deactivated' : 'deleted'
     const isActive = membershipStatus === 'active'
-    const displayName = isActive
-      ? row.workspaceMemberDisplayName?.trim() ||
-        row.workspaceMemberName?.trim() ||
-        row.userName?.trim() ||
-        'Participant'
-      : 'deactivated user'
-    const name = isActive
-      ? row.workspaceMemberName?.trim() || row.userName?.trim() || 'Participant'
-      : 'deactivated user'
-    const avatar = isActive
-      ? (row.workspaceMemberAvatar ?? row.userAvatar ?? null)
-      : null
+    const isDeleted = membershipStatus === 'deleted'
+    const displayName = isDeleted
+      ? 'Deleted user'
+      : isActive
+        ? row.workspaceMemberDisplayName?.trim() ||
+          row.workspaceMemberName?.trim() ||
+          row.userName?.trim() ||
+          'Participant'
+        : 'deactivated user'
+    const name = isDeleted
+      ? 'Deleted user'
+      : isActive
+        ? row.workspaceMemberName?.trim() || row.userName?.trim() || 'Participant'
+        : 'deactivated user'
+    const avatar = isDeleted
+      ? null
+      : isActive
+        ? (row.workspaceMemberAvatar ?? row.userAvatar ?? null)
+        : null
     return {
       id: row.id,
       sessionId: row.sessionId,

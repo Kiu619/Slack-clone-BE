@@ -1,13 +1,15 @@
 import { z } from 'zod'
+import { getChannelNameError } from '../channel-slug.util'
 
-const nameSchema = z
-  .string()
-  .min(2, 'Channel name must be at least 2 characters')
-  .max(80, 'Channel name must be at most 80 characters')
-  .regex(
-    /^[a-z0-9-_]+$/,
-    'Channel name can only contain lowercase letters, numbers, hyphens and underscores',
-  )
+const nameSchema = z.string().superRefine((v, ctx) => {
+  const message = getChannelNameError(v)
+  if (message !== null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message,
+    })
+  }
+})
 
 export const UpdateChannelSchema = z
   .object({

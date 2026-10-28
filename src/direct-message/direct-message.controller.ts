@@ -66,6 +66,15 @@ export class DirectMessageController {
     return this.directMessageService.getConversations(workspaceId, userId, q)
   }
 
+  @Get('unread-summary')
+  getUnreadSummary(
+    @Param('workspaceId') workspaceId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.directMessageService.getUnreadSummary(workspaceId, userId)
+  }
+
   @Get(':conversationId/invite-candidates')
   async getInviteCandidates(
     @Param('workspaceId') workspaceId: string,
@@ -112,6 +121,23 @@ export class DirectMessageController {
       conversationId,
       userId,
       dto.userIds,
+    )
+  }
+
+  @Delete(':conversationId/members/:memberUserId')
+  @HttpCode(HttpStatus.OK)
+  async removeConversationMember(
+    @Param('workspaceId') workspaceId: string,
+    @Param('conversationId') conversationId: string,
+    @Param('memberUserId') memberUserId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.directMessageService.removeConversationMember(
+      workspaceId,
+      conversationId,
+      userId,
+      memberUserId,
     )
   }
 

@@ -8,6 +8,7 @@ import {
 import { and, desc, eq, isNull, lt, or, sql } from 'drizzle-orm'
 import { randomUUID } from 'crypto'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
+import { isUniqueViolation } from '../common/utils/db-error.util'
 import {
   directMessageConversations,
   conversationMembers,
@@ -29,10 +30,10 @@ const FOLDER_ATTACHMENTS_PAGE_SIZE = 30
 
 const removedFolderAuthorNameExpr = sql<
   string | null
->`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`
 const removedFolderAuthorDisplayNameExpr = sql<
   string | null
->`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`
+>`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`
 const removedFolderAuthorAvatarExpr = sql<
   string | null
 >`CASE WHEN ${workspaceMembers.id} IS NULL THEN NULL ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar}) END`
@@ -142,8 +143,10 @@ export class FolderService {
   }
 
   private async enrichAttachmentWithSignedUrl<
-    T extends { url: string; name?: string },
+    T extends { url: string | null; name?: string },
   >(att: T): Promise<T> {
+    // Pending upload: chưa có URL thật → trả về nguyên row, không cần sign.
+    if (!att.url) return att
     const key = this.s3Service.parseS3KeyFromUrl(att.url)
     if (!key) return att
     try {
@@ -402,8 +405,7 @@ export class FolderService {
         },
       }
     } catch (e: unknown) {
-      const code = (e as { code?: string })?.code
-      if (code === '23505') {
+      if (isUniqueViolation(e)) {
         throw new ConflictException('A folder with this name already exists')
       }
       throw e
@@ -442,8 +444,7 @@ export class FolderService {
         },
       }
     } catch (e: unknown) {
-      const code = (e as { code?: string })?.code
-      if (code === '23505') {
+      if (isUniqueViolation(e)) {
         throw new ConflictException('A folder with this name already exists')
       }
       throw e
@@ -612,8 +613,7 @@ export class FolderService {
         addedById: userId,
       })
     } catch (e: unknown) {
-      const code = (e as { code?: string })?.code
-      if (code === '23505') {
+      if (isUniqueViolation(e)) {
         throw new ConflictException('This file is already in the folder')
       }
       throw e

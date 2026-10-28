@@ -27,6 +27,7 @@ import { BullModule } from '@nestjs/bullmq'
 import { NotificationModule } from './notification/notification.module'
 import { WorkspaceMemberPreferencesModule } from './workspace-member-preferences/workspace-member-preferences.module'
 import { HuddleModule } from './huddle/huddle.module'
+import { EmailInviteModule } from './email-invite/email-invite.module'
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard'
 import { WorkspaceMemberGuard } from './auth/guards/workspace-member.guard'
 import { CommonModule } from './common/common.module'
@@ -127,6 +128,7 @@ import { HttpLoggerMiddleware } from './common/middleware/http-logger.middleware
     RecentModule,
     CommonModule,
     WorkspacePermissionsModule,
+    EmailInviteModule,
   ],
 
   controllers: [AppController],

@@ -124,6 +124,21 @@ export class LaterController {
     )
   }
 
+  @Delete('attachments/:attachmentId')
+  @HttpCode(HttpStatus.OK)
+  async removeLaterByAttachmentId(
+    @Param('workspaceId') workspaceId: string,
+    @Param('attachmentId') attachmentId: string,
+    @Req() req: Request,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.laterService.removeInProgressItemsForAttachment(
+      userId,
+      workspaceId,
+      attachmentId,
+    )
+  }
+
   @Delete(':id')
   @HttpCode(HttpStatus.OK)
   async removeItem(

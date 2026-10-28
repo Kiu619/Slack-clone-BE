@@ -197,6 +197,32 @@ export class ChannelController {
     return result
   }
 
+  @Post(':channelId/leave')
+  @HttpCode(HttpStatus.OK)
+  async leaveChannel(
+    @Param('workspaceId') workspaceId: string,
+    @Param('channelId') channelId: string,
+    @Req() req: Request,
+    @Headers('x-socket-id') socketId?: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    const result = await this.channelService.leaveChannel(
+      channelId,
+      workspaceId,
+      userId,
+    )
+    this.broadcastService.broadcastChannelMembershipChanged(
+      workspaceId,
+      {
+        channelId,
+        affectedUserId: userId,
+        action: 'member_removed',
+      },
+      socketId,
+    )
+    return result
+  }
+
   @Put(':channelId/star')
   @HttpCode(HttpStatus.OK)
   async starChannel(

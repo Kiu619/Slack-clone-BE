@@ -12,6 +12,18 @@ async function bootstrap() {
 
   app.use(cookieParser.default())
 
+  // Authentication responses must never be revalidated from a browser cache.
+  // Without this, GET /auth/me can return 304; Axios treats 304 as a rejected
+  // response, which looks like an auth failure and can trigger redirect loops.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.path === '/auth' || req.path.startsWith('/auth/')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+      res.setHeader('Pragma', 'no-cache')
+      res.setHeader('Expires', '0')
+    }
+    next()
+  })
+
   const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:3045'
   app.use((req: Request, res: Response, next: NextFunction) => {
     const isMutatingMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(

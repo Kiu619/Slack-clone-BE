@@ -4,12 +4,18 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import { AttachmentService } from '../attachment/attachment.service'
 import { MessageService } from '../message/message.service'
 import { ChatBroadcastService } from '../chat/chat-broadcast.service'
-import { UnifiedBroadcastService } from '../chat/unified-broadcast.service'
+import {
+  UnifiedBroadcastService,
+  EntityAction,
+  EntityDomain,
+} from '../chat/unified-broadcast.service'
+import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 import {
   directMessageConversations,
   conversationMembers,
@@ -48,7 +54,7 @@ type DmConversationMember = {
   avatar: string | null
   displayName: string | null
   email: string
-  membershipStatus: 'active' | 'deactivated'
+  membershipStatus: 'active' | 'deactivated' | 'deleted'
   isAway: boolean | null
   status: string | null
   statusText: string | null
@@ -84,6 +90,7 @@ export class DirectMessageService {
     private readonly messageService: MessageService,
     private readonly chatBroadcastService: ChatBroadcastService,
     private readonly unifiedBroadcastService: UnifiedBroadcastService,
+    private readonly permissionsService: WorkspacePermissionsService,
   ) {}
 
   /**
@@ -120,6 +127,7 @@ export class DirectMessageService {
     tx: DMTransaction,
     conversationId: string,
   ) {
+    // Chỉ lấy tin nhắn ở main DM (parentId IS NULL), không lấy thread replies
     const [latest] = await tx
       .select({
         id: messages.id,
@@ -128,7 +136,12 @@ export class DirectMessageService {
         createdAt: messages.createdAt,
       })
       .from(messages)
-      .where(eq(messages.conversationId, conversationId))
+      .where(
+        and(
+          eq(messages.conversationId, conversationId),
+          isNull(messages.parentId),
+        ),
+      )
       .orderBy(desc(messages.createdAt))
       .limit(1)
 
@@ -145,11 +158,26 @@ export class DirectMessageService {
       return
     }
 
+    // Nếu content là empty/null, lấy tên file đầu tiên từ attachments
+    let lastMessageContent = latest.content
+    if (!lastMessageContent || lastMessageContent.trim() === '') {
+      const [firstAttachment] = await tx
+        .select({ name: attachments.name })
+        .from(attachments)
+        .where(eq(attachments.messageId, latest.id))
+        .orderBy(asc(attachments.createdAt))
+        .limit(1)
+
+      if (firstAttachment?.name) {
+        lastMessageContent = firstAttachment.name
+      }
+    }
+
     await tx
       .update(directMessageConversations)
       .set({
         lastMessageAt: latest.createdAt,
-        lastMessageContent: latest.content,
+        lastMessageContent,
         lastMessageUserId: latest.userId,
         lastMessageId: latest.id,
       })
@@ -585,22 +613,40 @@ export class DirectMessageService {
     }
 
     // Lấy danh sách thành viên kèm info profile
+    // Khi user bị hard-delete khỏi workspace_members → "Deleted user"
+    // Khi user bị deactivated → "Deactivated user" (mask name + avatar)
     const members = await this.db
       .select({
         id: users.id,
         name: sql<
           string | null
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
+        >`CASE
+          WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+          WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+          ELSE COALESCE(${workspaceMembers.name}, ${users.name})
+        END`,
         avatar: sql<
           string | null
-        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        >`CASE
+          WHEN ${workspaceMembers.id} IS NULL THEN NULL
+          WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN NULL
+          ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar})
+        END`,
         displayName: sql<
           string | null
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
+        >`CASE
+          WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+          WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+          ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})
+        END`,
         email: users.email,
         membershipStatus: sql<
-          'active' | 'deactivated'
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated' ELSE ${workspaceMembers.membershipStatus} END`,
+          'active' | 'deactivated' | 'deleted'
+        >`CASE
+          WHEN ${workspaceMembers.id} IS NULL THEN 'deleted'
+          WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'deactivated'
+          ELSE 'active'
+        END`,
         isAway: workspaceMembers.isAway,
         status: workspaceMembers.statusText,
         statusText: workspaceMembers.statusText,
@@ -622,6 +668,23 @@ export class DirectMessageService {
       throw new BadRequestException('You are not a member of this conversation')
     }
 
+    /**
+     * Bảo vệ: đối với DM 1-1 (isGroup = false), nếu peer không còn 'active' trong
+     * workspace (đã bị deactivate hoặc hard-delete khỏi workspace_members) thì
+     * trả về 404 để FE redirect về list. Lý do:
+     * - 1-1 conversation với peer đã mất tích sẽ bị ẩn khỏi sidebar
+     * - Cho phép user mở bằng URL sẽ tạo "phantom" UI không có action nào hoạt động
+     * - Group DM (isGroup = true) vẫn trả bình thường vì thành viên inactive
+     *   không ảnh hưởng visibility (giống Slack).
+     */
+    if (!conversation.isGroup) {
+      const otherMembers = members.filter((m) => m.id !== currentUserId)
+      const peer = otherMembers.length === 1 ? otherMembers[0] : null
+      if (peer && peer.membershipStatus !== 'active') {
+        throw new NotFoundException('Conversation not found')
+      }
+    }
+
     let lastMessageUser: {
       id: string
       name: string | null
@@ -633,10 +696,18 @@ export class DirectMessageService {
           id: users.id,
           name: sql<
             string | null
-          >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+          >`CASE
+            WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+            WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+            ELSE COALESCE(${workspaceMembers.name}, ${users.name})
+          END`,
           displayName: sql<
             string | null
-          >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+          >`CASE
+            WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+            WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+            ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})
+          END`,
         })
         .from(users)
         .leftJoin(
@@ -683,6 +754,127 @@ export class DirectMessageService {
       unreadCount: readState.get(conversationId)?.unreadCount ?? 0,
       isArchivedBecausePeerDeactivated,
     }
+  }
+
+  /**
+   * getUnreadSummary
+   * Trả về tổng số tin nhắn DM chưa đọc trên tất cả cuộc hội thoại của user trong một workspace.
+   *
+   * QUAN TRỌNG: Đối với DM 1-1 (isGroup = false), nếu peer không còn 'active' trong
+   * workspace (đã bị deactivate hoặc hard-delete khỏi workspace_members) thì KHÔNG
+   * được đếm vào unread tổng — conversation đó sẽ bị ẩn khỏi sidebar nên unread
+   * badge cũng phải loại trừ. Group DM (isGroup = true) luôn được đếm vì member
+   * inactive không ảnh hưởng visibility (giống Slack behavior).
+   */
+  async getUnreadSummary(
+    workspaceId: string,
+    userId: string,
+  ): Promise<{ count: number }> {
+    const userConversationIdsQuery = this.db
+      .select({ conversationId: conversationMembers.conversationId })
+      .from(conversationMembers)
+      .innerJoin(
+        directMessageConversations,
+        eq(directMessageConversations.id, conversationMembers.conversationId),
+      )
+      .where(
+        and(
+          eq(directMessageConversations.workspaceId, workspaceId),
+          eq(conversationMembers.userId, userId),
+        ),
+      )
+
+    const userConversationIds = await userConversationIdsQuery
+
+    if (userConversationIds.length === 0) return { count: 0 }
+
+    const ids = userConversationIds.map((c) => c.conversationId)
+    const readStates = await this.getConversationReadStates(workspaceId, userId, ids)
+
+    // Lấy isGroup cho từng conversation để biết 1-1 vs group
+    const convRows = await this.db
+      .select({
+        id: directMessageConversations.id,
+        isGroup: directMessageConversations.isGroup,
+        workspaceId: directMessageConversations.workspaceId,
+      })
+      .from(directMessageConversations)
+      .where(inArray(directMessageConversations.id, ids))
+
+    const isGroupByConvId = new Map(convRows.map((c) => [c.id, c.isGroup]))
+
+    // Lấy membership status của tất cả other members trong các conv 1-1
+    const oneToOneConvIds = ids.filter((id) => isGroupByConvId.get(id) === false)
+    const hiddenConvIds = await this.getHiddenOneToOneConvIds(
+      workspaceId,
+      userId,
+      oneToOneConvIds,
+    )
+
+    const count = Array.from(readStates.values()).filter((s) => {
+      if (s.unreadCount <= 0) return false
+      if (hiddenConvIds.has(s.conversationId)) return false
+      return true
+    }).length
+    return { count }
+  }
+
+  /**
+   * getHiddenOneToOneConvIds
+   * Trả về tập các conversation ID 1-1 mà peer không còn 'active' trong workspace.
+   * - isGroup = false
+   * - peer (member khác userId) có workspaceMembers.id IS NULL → 'deleted' (hard-delete)
+   * - hoặc workspaceMembers.membershipStatus IN ('deactivated', 'deleted')
+   *
+   * Tối ưu: 1 query duy nhất cho tất cả 1-1 conv IDs (thay vì N+1).
+   * Group DMs không cần filter (Slack: member inactive vẫn hiển thị group).
+   */
+  private async getHiddenOneToOneConvIds(
+    workspaceId: string,
+    userId: string,
+    oneToOneConvIds: string[],
+  ): Promise<Set<string>> {
+    if (oneToOneConvIds.length === 0) return new Set()
+
+    const rows = await this.db
+      .select({
+        conversationId: conversationMembers.conversationId,
+        peerStatus: sql<
+          'active' | 'deactivated' | 'deleted'
+        >`CASE
+          WHEN ${workspaceMembers.id} IS NULL THEN 'deleted'
+          ELSE ${workspaceMembers.membershipStatus}
+        END`,
+      })
+      .from(conversationMembers)
+      .innerJoin(
+        users,
+        eq(users.id, conversationMembers.userId),
+      )
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, users.id),
+          eq(workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
+      .where(
+        and(
+          // other members: loại trừ chính userId
+          ne(conversationMembers.userId, userId),
+          inArray(conversationMembers.conversationId, oneToOneConvIds),
+        ),
+      )
+
+    // conversation bị ẩn nếu TẤT CẢ other members đều không active
+    // (1-1 chỉ có 1 peer nên đơn giản chỉ check peer != 'active')
+    const inactiveByConv = new Map<string, boolean>()
+    for (const row of rows) {
+      const convId = row.conversationId
+      const isInactive = row.peerStatus !== 'active'
+      if (isInactive) inactiveByConv.set(convId, true)
+    }
+    return new Set(inactiveByConv.keys())
   }
 
   /**
@@ -752,17 +944,33 @@ export class DirectMessageService {
             id: users.id,
             name: sql<
               string | null
-            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
+            >`CASE
+              WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+              WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+              ELSE COALESCE(${workspaceMembers.name}, ${users.name})
+            END`,
             avatar: sql<
               string | null
-            >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+            >`CASE
+              WHEN ${workspaceMembers.id} IS NULL THEN NULL
+              WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN NULL
+              ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar})
+            END`,
             displayName: sql<
               string | null
-            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
+            >`CASE
+              WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+              WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+              ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})
+            END`,
             email: users.email,
             membershipStatus: sql<
-              'active' | 'deactivated'
-            >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated' ELSE ${workspaceMembers.membershipStatus} END`,
+              'active' | 'deactivated' | 'deleted'
+            >`CASE
+              WHEN ${workspaceMembers.id} IS NULL THEN 'deleted'
+              WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'deactivated'
+              ELSE 'active'
+            END`,
             isAway: workspaceMembers.isAway,
             status: workspaceMembers.statusText,
             statusText: workspaceMembers.statusText,
@@ -791,10 +999,18 @@ export class DirectMessageService {
               id: users.id,
               name: sql<
                 string | null
-              >`COALESCE(${workspaceMembers.name}, ${users.name})`,
+              >`CASE
+                WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+                WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+                ELSE COALESCE(${workspaceMembers.name}, ${users.name})
+              END`,
               displayName: sql<
                 string | null
-              >`COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})`,
+              >`CASE
+                WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+                WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+                ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})
+              END`,
             })
             .from(users)
             .leftJoin(
@@ -928,7 +1144,25 @@ export class DirectMessageService {
       this.chatBroadcastService.broadcastMessage(room, m, undefined)
     }
 
-    return this.getConversationById(conversationId, userId, workspaceId)
+    // Lightweight: chỉ trả về dữ liệu tối thiểu để FE patch cache.
+    // Tránh gọi getConversationById (nặng + có thể throw race-condition sau update).
+    const [selfMembership] = await this.db
+      .select({ starredAt: conversationMembers.starredAt })
+      .from(conversationMembers)
+      .where(
+        and(
+          eq(conversationMembers.conversationId, conversationId),
+          eq(conversationMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    return {
+      id: conversationId,
+      workspaceId,
+      ...patch,
+      starredAt: selfMembership?.starredAt ?? null,
+    }
   }
 
   /**
@@ -1195,6 +1429,117 @@ export class DirectMessageService {
     })
 
     return this.getConversationById(conversationId, requesterId, workspaceId)
+  }
+
+  /**
+   * Xoá 1 thành viên khỏi group DM (admin only). Không hỗ trợ 1-1 DM.
+   * - Permission: 'manage_user_permissions' (chỉ admin/owner)
+   * - Sau khi xoá, nếu chỉ còn ≤ 2 members → downgrade về isGroup = false
+   * - Broadcast WS event `dm:member-removed` để FE update cache.
+   */
+  async removeConversationMember(
+    workspaceId: string,
+    conversationId: string,
+    requesterId: string,
+    targetUserId: string,
+  ): Promise<{ ok: true }> {
+    if (requesterId === targetUserId) {
+      throw new ForbiddenException('You cannot remove yourself from a DM')
+    }
+
+    // Check conversation tồn tại + là group DM
+    const [conv] = await this.db
+      .select({
+        id: directMessageConversations.id,
+        isGroup: directMessageConversations.isGroup,
+      })
+      .from(directMessageConversations)
+      .where(
+        and(
+          eq(directMessageConversations.id, conversationId),
+          eq(directMessageConversations.workspaceId, workspaceId),
+        ),
+      )
+      .limit(1)
+
+    if (!conv) {
+      throw new NotFoundException('Conversation not found')
+    }
+
+    if (!conv.isGroup) {
+      throw new ForbiddenException(
+        'Cannot remove members from a 1-1 conversation',
+      )
+    }
+
+    // Requester phải là admin/owner
+    await this.permissionsService.requireUserPermission(
+      workspaceId,
+      requesterId,
+      'manage_user_permissions',
+    )
+
+    // Check targetUser là member
+    const [member] = await this.db
+      .select({ userId: conversationMembers.userId })
+      .from(conversationMembers)
+      .where(
+        and(
+          eq(conversationMembers.conversationId, conversationId),
+          eq(conversationMembers.userId, targetUserId),
+        ),
+      )
+      .limit(1)
+
+    if (!member) {
+      throw new NotFoundException('User is not in this conversation')
+    }
+
+    await this.db.transaction(async (tx) => {
+      await tx
+        .delete(conversationMembers)
+        .where(
+          and(
+            eq(conversationMembers.conversationId, conversationId),
+            eq(conversationMembers.userId, targetUserId),
+          ),
+        )
+
+      // Đếm members còn lại sau khi xoá
+      const remaining = await tx
+        .select({ userId: conversationMembers.userId })
+        .from(conversationMembers)
+        .where(eq(conversationMembers.conversationId, conversationId))
+
+      if (remaining.length <= 2) {
+        // Downgrade về 1-1 nếu chỉ còn 2 members
+        await tx
+          .update(directMessageConversations)
+          .set({ isGroup: false })
+          .where(eq(directMessageConversations.id, conversationId))
+      }
+    })
+
+    // Broadcast để FE invalidate DM cache — gửi tới conversation room
+    this.unifiedBroadcastService.syncEntity(
+      { workspaceId, conversationId },
+      {
+        domain: EntityDomain.DM_CONVERSATION,
+        action: EntityAction.SYNC,
+        payload: {
+          id: conversationId,
+          workspaceId,
+          conversationId,
+          data: {
+            kind: 'membership' as const,
+            affectedUserId: targetUserId,
+            action: 'member_removed' as const,
+          },
+        },
+      },
+    )
+
+    return { ok: true as const }
   }
 
   private toStarredAtIso(v: Date | string | null | undefined): string | null {

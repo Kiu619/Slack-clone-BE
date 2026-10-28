@@ -210,7 +210,7 @@ export class WorkspacePermissionsService {
   ): Promise<{
     id: string
     role: WorkspaceRoleKey
-    membershipStatus: 'active' | 'deactivated'
+    membershipStatus: 'active' | 'deactivated' | 'deleted'
   } | null> {
     const [membership] = await this.db
       .select({

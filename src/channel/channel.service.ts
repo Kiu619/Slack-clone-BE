@@ -20,6 +20,7 @@ import {
 import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
 import type { CreateChannelDto } from './dto/create-channel.dto'
 import type { UpdateChannelDto } from './dto/update-channel.dto'
+import { slugifyChannelName } from './channel-slug.util'
 
 @Injectable()
 export class ChannelService {
@@ -31,20 +32,14 @@ export class ChannelService {
     private readonly permissionsService: WorkspacePermissionsService,
   ) {}
 
-  private slugify(name: string): string {
-    return name
-      .toLowerCase()
-      .trim()
-      .replace(/\s+/g, '-')
-      .replace(/[^a-z0-9-_]/g, '')
-  }
-
   /**
-   * Tên kênh hợp lệ (CreateChannelDto) từ slug workspace: cùng quy tắc slugify,
-   * tối thiểu 2 ký tự (fallback "general").
+   * Tên kênh hợp lệ (CreateChannelDto) từ slug workspace: dùng helper
+   * chung `slugifyChannelName` — giữ nguyên Unicode (chữ/số của mọi ngôn
+   * ngữ), chỉ thay space → `-`, lowercase + trim. Tối thiểu 2 ký tự
+   * (fallback "general").
    */
   channelNameFromWorkspaceSlug(workspaceSlug: string): string {
-    let n = this.slugify(workspaceSlug)
+    let n = slugifyChannelName(workspaceSlug)
     if (n.length < 2) {
       n = 'general'
     }
@@ -76,6 +71,50 @@ export class ChannelService {
     return member
   }
 
+  /** JOIN users + LEFT JOIN workspace_members để resolve creator display info. */
+  private async resolveCreator(
+    workspaceId: string,
+    createdById: string | null,
+  ): Promise<{
+    id: string
+    name: string | null
+    displayName: string | null
+    avatar: string | null
+    isActive: boolean
+  } | null> {
+    if (!createdById) return null
+
+    const [row] = await this.db
+      .select({
+        id: users.id,
+        name: users.name,
+        displayName: workspaceMembers.displayName,
+        avatar: sql<
+          string | null
+        >`COALESCE(${workspaceMembers.avatar}, ${users.avatar})`,
+        membershipStatus: workspaceMembers.membershipStatus,
+      })
+      .from(users)
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, users.id),
+          eq(workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
+      .where(eq(users.id, createdById))
+      .limit(1)
+
+    if (!row) return null
+    return {
+      id: row.id,
+      name: row.name,
+      displayName: row.displayName,
+      avatar: row.avatar,
+      isActive: row.membershipStatus === 'active',
+    }
+  }
+
   async create(workspaceId: string, userId: string, dto: CreateChannelDto) {
     await this.assertMembership(workspaceId, userId)
     if (dto.isPrivate) {
@@ -92,7 +131,7 @@ export class ChannelService {
       )
     }
 
-    const slug = this.slugify(dto.name)
+    const slug = slugifyChannelName(dto.name)
 
     const [existing] = await this.db
       .select({ id: channels.id })
@@ -138,7 +177,8 @@ export class ChannelService {
       role: 'owner',
     })
 
-    return { ...channel, starredAt: null as Date | null }
+    const createdBy = await this.resolveCreator(workspaceId, userId)
+    return { ...channel, createdBy, starredAt: null as Date | null }
   }
 
   async update(
@@ -180,7 +220,7 @@ export class ChannelService {
     } = {}
 
     if (dto.name !== undefined) {
-      const slug = this.slugify(dto.name)
+      const slug = slugifyChannelName(dto.name)
       const [slugConflict] = await this.db
         .select({ id: channels.id })
         .from(channels)
@@ -244,6 +284,8 @@ export class ChannelService {
     const norm = (v: string | null | undefined) =>
       v == null || String(v).trim() === '' ? null : String(v).trim()
 
+    const nameChanged =
+      dto.name !== undefined && norm(channel.name) !== norm(result.name)
     const topicChanged =
       dto.topic !== undefined && norm(channel.topic) !== norm(result.topic)
     const descriptionChanged =
@@ -257,6 +299,15 @@ export class ChannelService {
       dto.isPrivate !== undefined && channel.isPrivate !== result.isPrivate
 
     const room = `channel:${channelId}`
+    if (nameChanged) {
+      const m = await this.messageService.createTimelineTextMessage(
+        { channelId },
+        userId,
+        'channel_name',
+        result.name,
+      )
+      this.chatBroadcastService.broadcastMessage(room, m, undefined)
+    }
     if (topicChanged) {
       const m = await this.messageService.createTimelineTextMessage(
         { channelId },
@@ -355,9 +406,33 @@ export class ChannelService {
         ),
       )
 
+    // Batch-resolve all creators
+    const uniqueCreatorIds = [
+      ...new Set(
+        rows.map((r) => r.channel.createdById).filter(Boolean) as string[],
+      ),
+    ]
+    const creatorMap = new Map<
+      string,
+      NonNullable<Awaited<ReturnType<typeof this.resolveCreator>>>
+    >()
+    if (uniqueCreatorIds.length > 0) {
+      const creatorRows = await Promise.all(
+        uniqueCreatorIds.map((id) => this.resolveCreator(workspaceId, id)),
+      )
+      for (let i = 0; i < uniqueCreatorIds.length; i++) {
+        if (creatorRows[i]) {
+          creatorMap.set(uniqueCreatorIds[i], creatorRows[i]!)
+        }
+      }
+    }
+
     return rows
       .map((r) => ({
         ...r.channel,
+        createdBy: r.channel.createdById
+          ? (creatorMap.get(r.channel.createdById) ?? null)
+          : null,
         starredAt: r.starredAt ?? null,
       }))
       .sort((a, b) => a.name.localeCompare(b.name))
@@ -379,7 +454,11 @@ export class ChannelService {
     }
 
     const [membership] = await this.db
-      .select({ id: channelMembers.id, starredAt: channelMembers.starredAt })
+      .select({
+        id: channelMembers.id,
+        starredAt: channelMembers.starredAt,
+        lastReadAt: channelMembers.lastReadAt,
+      })
       .from(channelMembers)
       .where(
         and(
@@ -395,9 +474,15 @@ export class ChannelService {
       )
     }
 
+    const createdBy = await this.resolveCreator(
+      workspaceId,
+      channel.createdById,
+    )
     return {
       ...channel,
+      createdBy,
       starredAt: membership?.starredAt ?? null,
+      lastReadAt: membership?.lastReadAt ?? null,
     }
   }
 
@@ -515,6 +600,7 @@ export class ChannelService {
       statusEmoji: workspaceMembers.statusEmoji,
       statusText: workspaceMembers.statusText,
       joinedAt: joinedAtCol,
+      membershipStatus: workspaceMembers.membershipStatus,
     }
   }
 
@@ -799,6 +885,75 @@ export class ChannelService {
     if (!row) {
       throw new NotFoundException('User is not in this channel')
     }
+
+    return { ok: true as const }
+  }
+
+  /**
+   * User tự rời channel. Block default channel + owner cuối cùng.
+   * Broadcast `member_removed` để sidebar/Members tab cập nhật.
+   */
+  async leaveChannel(
+    channelId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<{ ok: true }> {
+    await this.assertMembership(workspaceId, userId)
+
+    const [ch] = await this.db
+      .select({ isDefaultChannel: channels.isDefaultChannel })
+      .from(channels)
+      .where(
+        and(eq(channels.id, channelId), eq(channels.workspaceId, workspaceId)),
+      )
+      .limit(1)
+
+    if (!ch) {
+      throw new NotFoundException('Channel not found')
+    }
+
+    if (ch.isDefaultChannel) {
+      throw new ForbiddenException(
+        'You cannot leave the default channel of this workspace',
+      )
+    }
+
+    const [mem] = await this.db
+      .select({ id: channelMembers.id, role: channelMembers.role })
+      .from(channelMembers)
+      .where(
+        and(
+          eq(channelMembers.channelId, channelId),
+          eq(channelMembers.userId, userId),
+        ),
+      )
+      .limit(1)
+
+    if (!mem) {
+      throw new NotFoundException('You are not a member of this channel')
+    }
+
+    const isOwner = mem.role === 'owner' || mem.role === 'primary_owner'
+
+    if (isOwner) {
+      const [ownerCount] = await this.db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(channelMembers)
+        .where(
+          and(
+            eq(channelMembers.channelId, channelId),
+            inArray(channelMembers.role, ['owner', 'primary_owner']),
+          ),
+        )
+
+      if ((ownerCount?.n ?? 0) <= 1) {
+        throw new ForbiddenException(
+          'You cannot leave this channel because you are the only owner. Please transfer ownership to another member first.',
+        )
+      }
+    }
+
+    await this.db.delete(channelMembers).where(eq(channelMembers.id, mem.id))
 
     return { ok: true as const }
   }

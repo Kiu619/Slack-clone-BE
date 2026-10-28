@@ -89,6 +89,54 @@ export const workspaces = pgTable(
   ],
 )
 
+/**
+ * Email-based workspace invites (one-time secure token + OTP).
+ *
+ * Mỗi lần admin/owner gửi invite email cho một địa chỉ, ta tạo 1 row ở bảng này.
+ * - `token` (UUID) là URL an toàn, gửi qua email `/join/email-invite/{token}`
+ * - OTP là lớp thứ 2 verify ownership email.
+ * - status: pending → accepted | revoked | expired
+ */
+export const workspaceEmailInvites = pgTable(
+  'workspace_email_invites',
+  {
+    id: text('id')
+      .primaryKey()
+      .$defaultFn(() => randomUUID()),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    email: text('email').notNull(),
+    token: text('token').notNull().unique(),
+    invitedByUserId: text('invited_by_user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    channelId: text('channel_id'),
+    status: text('status', {
+      enum: ['pending', 'accepted', 'revoked', 'expired'],
+    })
+      .notNull()
+      .default('pending'),
+    acceptedByUserId: text('accepted_by_user_id').references(
+      () => users.id,
+      { onDelete: 'set null' },
+    ),
+    acceptedAt: timestamp('accepted_at'),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('workspace_email_invites_token_unique').on(table.token),
+    index('workspace_email_invites_workspace_idx').on(table.workspaceId),
+    index('workspace_email_invites_email_idx').on(table.email),
+    index('workspace_email_invites_status_idx').on(table.status),
+  ],
+)
+
 // Junction table: workspace members (many-to-many users <-> workspaces)
 export const workspaceMembers = pgTable(
   'workspace_members',
@@ -106,7 +154,7 @@ export const workspaceMembers = pgTable(
       .notNull()
       .default('member'),
     membershipStatus: text('membership_status', {
-      enum: ['active', 'deactivated'],
+      enum: ['active', 'deactivated', 'deleted'],
     })
       .notNull()
       .default('active'),
@@ -125,6 +173,7 @@ export const workspaceMembers = pgTable(
     statusEmoji: text('status_emoji'),
     statusExpiration: timestamp('status_expiration'),
     notificationsPausedUntil: timestamp('notifications_paused_until'),
+    autoPaused: boolean('auto_paused').notNull().default(false),
     theme: text('theme'),
 
     // ─── Global notification preferences ───
@@ -139,6 +188,12 @@ export const workspaceMembers = pgTable(
     notifyOnChannelMention: boolean('notify_on_channel_mention')
       .notNull()
       .default(true),
+    notifyOnThreadReply: boolean('notify_on_thread_reply')
+      .notNull()
+      .default(true),
+    notifyOnHuddle: boolean('notify_on_huddle')
+      .notNull()
+      .default(true),
 
     // ─── Do Not Disturb ───
     dndEnabled: boolean('dnd_enabled').notNull().default(false),
@@ -146,6 +201,17 @@ export const workspaceMembers = pgTable(
     dndStartHour: integer('dnd_start_hour'),
     dndEndHour: integer('dnd_end_hour'),
     dndTimezone: text('dnd_timezone'),
+
+    // ─── Browser Notifications ───
+    desktopNotificationsEnabled: boolean('desktop_notifications_enabled')
+      .notNull()
+      .default(true),
+
+    // ─── Notification Sounds ───
+    soundEnabled: boolean('sound_enabled').notNull().default(true),
+    soundType: text('sound_type'),
+    messageSoundType: text('message_sound_type'),
+    huddleSoundType: text('huddle_sound_type'),
   },
   (table) => [
     uniqueIndex('workspace_members_unique').on(table.workspaceId, table.userId),
@@ -664,7 +730,13 @@ export const attachments = pgTable(
     fileCategory: text('file_category').notNull().default('other'),
     // ----------------------------------------------
 
-    url: text('url').notNull(),
+    url: text('url'), // Cho phép null/empty khi attachment đang pending upload (sẽ được PATCH sau)
+    /**
+     * Client-generated uploadId (Math.random) cho optimistic attachment.
+     * Dùng để match attachment row với client upload progress + retry + finalize.
+     * Null khi attachment đã finalize (URL đã có).
+     */
+    pendingUploadId: text('pending_upload_id'),
     /** 'image' | 'video' | 'audio' | 'file' */
     type: text('type').notNull().default('file'),
     name: text('name').notNull(),
@@ -941,9 +1013,16 @@ export const savedItems = pgTable(
     /** Ghi chú cá nhân của user cho mục này */
     note: text('note'),
     /** Thời điểm nhắc nhở */
-    remindAt: timestamp('remind_at'),
+    remindAt: timestamp('remind_at', { withTimezone: true }),
     status: savedItemStatusEnum('status').notNull().default('in_progress'),
     completedAt: timestamp('completed_at'),
+    /**
+     * Timestamp marker set by LaterReminderProcessor when the reminder has fired.
+     * Combined with `reminderFiredAt IS NULL` in queries and partial indexes, this
+     * guarantees the browser notification fires exactly once even when BullMQ
+     * retries, multiple tabs reconnect, or the processor runs again.
+     */
+    reminderFiredAt: timestamp('reminder_fired_at', { withTimezone: true }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
@@ -981,6 +1060,13 @@ export const savedItems = pgTable(
       table.type,
       table.attachmentId,
     ),
+    // Partial index used by LaterReminderProcessor — keeps the queue worker's
+    // "pending reminders" scan cheap as the table grows.
+    index('saved_items_reminder_pending_idx')
+      .on(table.remindAt)
+      .where(
+        sql`${table.remindAt} IS NOT NULL AND ${table.reminderFiredAt} IS NULL AND ${table.status} = 'in_progress'`,
+      ),
   ],
 )
 
@@ -1015,6 +1101,10 @@ export const channelNotificationOverrides = pgTable(
     }),
     /** Mute tạm thời đến thời điểm này */
     mutedUntil: timestamp('muted_until'),
+    /** Notify về thread replies trong channel này (null = inherit từ workspace pref) */
+    notifyOnThreadReply: boolean('notify_on_thread_reply'),
+    /** Notify về huddles mới trong channel này (null = inherit từ workspace pref) */
+    notifyOnHuddle: boolean('notify_on_huddle'),
   },
   (table) => [
     uniqueIndex('channel_notif_override_channel_unique').on(
@@ -1150,6 +1240,10 @@ export const workspaceMembersRelations = relations(
     user: one(users, {
       fields: [workspaceMembers.userId],
       references: [users.id],
+    }),
+    preferences: one(workspaceMemberPreferences, {
+      fields: [workspaceMembers.workspaceId, workspaceMembers.userId],
+      references: [workspaceMemberPreferences.workspaceId, workspaceMemberPreferences.userId],
     }),
   }),
 )
@@ -1423,6 +1517,56 @@ export const savedItemsRelations = relations(savedItems, ({ one }) => ({
   }),
 }))
 
+// ─── Workspace Member Preferences ──────────────────────────────────────────────
+
+export const localeEnum = pgEnum('locale', ['en', 'vi'])
+export const timeFormatEnum = pgEnum('time_format', ['12h', '24h'])
+
+export const workspaceMemberPreferences = pgTable(
+  'workspace_member_preferences',
+  {
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    locale: localeEnum('locale'),
+    timeFormat: timeFormatEnum('time_format'),
+    desktopNotificationsEnabled: boolean('desktop_notifications_enabled')
+      .notNull()
+      .default(false),
+    // Also notify you about (workspace-level defaults)
+    notifyOnThreadReply: boolean('notify_on_thread_reply').notNull().default(true),
+    notifyOnHuddle: boolean('notify_on_huddle').notNull().default(true),
+    huddleSoundType: text('huddle_sound_type'),
+    availabilitySchedule: jsonb('availability_schedule').$type<AvailabilitySchedule | null>(),
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex('wmp_workspace_user_unique').on(table.workspaceId, table.userId),
+    index('wmp_workspace_idx').on(table.workspaceId),
+    index('wmp_user_idx').on(table.userId),
+  ],
+)
+
+export const workspaceMemberPreferencesRelations = relations(
+  workspaceMemberPreferences,
+  ({ one }) => ({
+    workspace: one(workspaces, {
+      fields: [workspaceMemberPreferences.workspaceId],
+      references: [workspaces.id],
+    }),
+    user: one(users, {
+      fields: [workspaceMemberPreferences.userId],
+      references: [users.id],
+    }),
+  }),
+)
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type User = typeof users.$inferSelect
@@ -1476,3 +1620,22 @@ export type ChannelNotificationOverride =
   typeof channelNotificationOverrides.$inferSelect
 export type NewChannelNotificationOverride =
   typeof channelNotificationOverrides.$inferInsert
+export type WorkspaceMemberPreference =
+  typeof workspaceMemberPreferences.$inferSelect
+export type NewWorkspaceMemberPreference =
+  typeof workspaceMemberPreferences.$inferInsert
+
+export type WeekDay = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun'
+
+export type AvailabilityDaySchedule = {
+  day: WeekDay
+  startTime: string // HH:mm
+  endTime: string   // HH:mm (validated end > start)
+}
+
+export type AvailabilitySchedule = {
+  scheduleType: 'every_day' | 'weekdays' | 'custom'
+  startTime: string // HH:mm
+  endTime: string   // HH:mm
+  days?: AvailabilityDaySchedule[]
+}

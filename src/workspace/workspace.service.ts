@@ -5,14 +5,13 @@ import {
   Logger,
   NotFoundException,
   ForbiddenException,
+  forwardRef,
 } from '@nestjs/common'
 import { eq, and, sql, asc, desc, ilike, or, inArray } from 'drizzle-orm'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import {
-  channelMembers,
   channels,
   conversationMembers,
-  directMessageConversations,
   workspaces,
   workspaceMembers,
   users,
@@ -27,6 +26,7 @@ import type { UpdateWorkspacePermissionDto } from './dto/update-workspace-permis
 import { UserProfileBroadcastService } from '../user-profile/user-profile-broadcast.service'
 import { ChannelService } from '../channel/channel.service'
 import { WorkspaceEmojisService } from '../workspace-emojis/workspace-emojis.service'
+import { EmailInviteService } from '../email-invite/email-invite.service'
 import {
   UnifiedBroadcastService,
   EntityAction,
@@ -45,6 +45,9 @@ export class WorkspaceService {
     private readonly channelService: ChannelService,
     private readonly permissionsService: WorkspacePermissionsService,
     private readonly workspaceEmojisService: WorkspaceEmojisService,
+    // forwardRef: WorkspaceModule ↔ EmailInviteModule circular (xem workspace.module.ts)
+    @Inject(forwardRef(() => EmailInviteService))
+    private readonly emailInviteService: EmailInviteService,
   ) {}
 
   private async getWorkspaceMembership(workspaceId: string, userId: string) {
@@ -63,6 +66,10 @@ export class WorkspaceService {
       )
       .limit(1)
     return membership ?? null
+  }
+
+  async getMemberMembership(workspaceId: string, userId: string) {
+    return this.getWorkspaceMembership(workspaceId, userId)
   }
 
   private async assertActiveWorkspaceMember(
@@ -116,6 +123,7 @@ export class WorkspaceService {
       name: creator?.name ?? null,
       avatar: creator?.avatar ?? null,
       theme: null,
+      timeZone: dto.timeZone ?? null,
     })
 
     await this.permissionsService.seedWorkspacePermissions(workspace.id)
@@ -132,10 +140,11 @@ export class WorkspaceService {
     // Send invite emails to memberEmails (fire-and-forget, don't block response)
     if (dto.memberEmails && dto.memberEmails.length > 0) {
       this.sendInviteEmails({
+        workspaceId: workspace.id,
         emails: dto.memberEmails,
+        inviterId: userId,
         inviterName: creator?.name ?? creator?.email ?? 'Someone',
         workspaceName: workspace.name,
-        inviteCode: workspace.inviteCode,
       }).catch((err) => this.logger.error('Error sending invite emails', err))
     }
 
@@ -143,16 +152,41 @@ export class WorkspaceService {
   }
 
   private async sendInviteEmails(params: {
+    workspaceId: string
     emails: string[]
+    inviterId: string
     inviterName: string
     workspaceName: string
-    inviteCode: string
   }) {
     const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3045'
-    const inviteUrl = `${frontendUrl}/join/${params.inviteCode}`
+
+    // Tạo row workspace_email_invites cho mỗi email → lấy token UUID
+    // → build URL `/join/email-invite/{token}` để user mở email bấm Accept
+    // vào đúng flow OTP đã có (FE: /join/email-invite/[token]/page.tsx).
+    const inviteUrls = await Promise.all(
+      params.emails.map(async (email) => {
+        try {
+          const { token } = await this.emailInviteService.createInvite({
+            workspaceId: params.workspaceId,
+            email,
+            invitedByUserId: params.inviterId,
+          })
+          return { email, inviteUrl: `${frontendUrl}/join/email-invite/${token}` }
+        } catch (err) {
+          this.logger.warn(
+            `Failed to create email-invite row for ${email}: ${err instanceof Error ? err.message : String(err)}`,
+          )
+          return null
+        }
+      }),
+    )
+
+    const valid = inviteUrls.filter(
+      (x): x is { email: string; inviteUrl: string } => x !== null,
+    )
 
     const results = await Promise.allSettled(
-      params.emails.map((email) =>
+      valid.map(({ email, inviteUrl }) =>
         this.mail.sendWorkspaceInvite(
           email,
           params.inviterName,
@@ -165,21 +199,25 @@ export class WorkspaceService {
     results.forEach((result, i) => {
       if (result.status === 'rejected') {
         this.logger.warn(
-          `Failed to send invite to ${params.emails[i]}: ${result.reason}`,
+          `Failed to send invite to ${valid[i].email}: ${result.reason}`,
         )
       }
     })
   }
 
   /**
-   * Gửi email mời tham gia workspace (link /join/:inviteCode) — Resend.
+   * Gửi email mời tham gia workspace (link /join/email-invite/{token}) — Resend.
    * Bỏ qua email đã là member workspace.
+   *
+   * Multi-channel: với mỗi email × mỗi channelId tạo 1 row invite (1 row / channel).
+   * Atomic all-or-nothing: throw bất kỳ error nào → controller 500, không có
+   * partial state trong DB.
    */
   async sendWorkspaceInvitesByEmail(
     workspaceId: string,
     requesterId: string,
     emails: string[],
-    channelId?: string,
+    channelIds?: string[],
   ) {
     const [membership] = await this.db
       .select({
@@ -225,14 +263,31 @@ export class WorkspaceService {
 
     const inviterName = inviter?.name ?? inviter?.email ?? 'Someone'
 
-    let inviteChannelName: string | undefined
-    if (channelId) {
-      const ch = await this.channelService.findOne(
-        channelId,
-        workspaceId,
-        requesterId,
-      )
-      inviteChannelName = ch.name
+    // Validate channels batch (1 query) + assert permission add-member cho từng channel.
+    // Nếu có channel không tồn tại → 404; nếu user thiếu permission → 403.
+    if (channelIds && channelIds.length > 0) {
+      const chRows = await this.db
+        .select({ id: channels.id })
+        .from(channels)
+        .where(
+          and(
+            eq(channels.workspaceId, workspaceId),
+            inArray(channels.id, channelIds),
+          ),
+        )
+
+      if (chRows.length !== new Set(channelIds).size) {
+        throw new NotFoundException(
+          'One or more channels not found in this workspace',
+        )
+      }
+
+      // User phải có quyền add member vào workspace (đã check ở trên) → áp
+      // cho TẤT CẢ channels. Verify thực tế qua findOne (nếu channel private
+      // mà user thiếu quyền read → throw).
+      for (const cid of channelIds) {
+        await this.channelService.findOne(cid, workspaceId, requesterId)
+      }
     }
 
     const membersWithEmail = await this.db
@@ -246,13 +301,15 @@ export class WorkspaceService {
     )
 
     const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3045'
-    const inviteUrl = `${frontendUrl}/join/${workspace.inviteCode}`
 
     const seen = new Set<string>()
     let sent = 0
     let skipped = 0
     const failed: { email: string; message: string }[] = []
 
+    // Outer loop: emails. Inner loop: channelIds.
+    // Không try/catch wrapper — bất kỳ lỗi nào (token DB / Resend) sẽ throw
+    // và rollback toàn bộ (all-or-nothing).
     for (const raw of emails) {
       const trimmed = raw.trim()
       const lower = trimmed.toLowerCase()
@@ -264,23 +321,77 @@ export class WorkspaceService {
         continue
       }
 
-      try {
+      // Nếu channelIds rỗng / undefined → tạo 1 row invite với channelId=null
+      // (chỉ mời workspace, không auto-add vào channel nào).
+      const channelList = channelIds && channelIds.length > 0 ? channelIds : [undefined]
+
+      for (const channelId of channelList) {
+        // Tạo row workspace_email_invites để lấy token UUID
+        // → build URL `/join/email-invite/{token}` cho user mở email Accept.
+        const { token } = await this.emailInviteService.createInvite({
+          workspaceId,
+          email: lower,
+          invitedByUserId: requesterId,
+          channelId,
+        })
+        const inviteUrl = `${frontendUrl}/join/email-invite/${token}`
+
+        // Email body KHÔNG nhắc channel (theo yêu cầu "no-channel-line"):
+        // chỉ mời join workspace — channel assignments sẽ tự động xảy ra
+        // khi user accept invite (xem acceptInvite).
         await this.mail.sendWorkspaceInvite(
           trimmed,
           inviterName,
           workspace.name,
           inviteUrl,
-          inviteChannelName,
         )
-        sent++
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        this.logger.warn(`Invite email failed for ${trimmed}: ${msg}`)
-        failed.push({ email: trimmed, message: msg })
       }
+      sent++
     }
 
     return { sent, skipped, failed }
+  }
+
+  /**
+   * Trả về danh sách email của TẤT CẢ active workspace members.
+   * Dùng cho dialog Invite People check email đã ở workspace trước khi gửi
+   * (block thay vì để backend skip sau khi gửi).
+   *
+   * Auth: caller phải là workspace member (403 nếu không) — chỉ member mới
+   * cần biết ai khác đang ở workspace này.
+   */
+  async getActiveMemberEmails(
+    workspaceId: string,
+    requesterId: string,
+  ): Promise<string[]> {
+    const [membership] = await this.db
+      .select({ id: workspaceMembers.id })
+      .from(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, requesterId),
+          eq(workspaceMembers.membershipStatus, 'active'),
+        ),
+      )
+      .limit(1)
+
+    if (!membership) {
+      throw new ForbiddenException('You are not a member of this workspace')
+    }
+
+    const rows = await this.db
+      .select({ email: users.email })
+      .from(workspaceMembers)
+      .innerJoin(users, eq(users.id, workspaceMembers.userId))
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.membershipStatus, 'active'),
+        ),
+      )
+
+    return rows.map((r) => r.email.toLowerCase())
   }
 
   async findAllByUser(userId: string) {
@@ -391,7 +502,7 @@ export class WorkspaceService {
     )
   }
 
-  async joinByInviteCode(userId: string, inviteCode: string) {
+  async joinByInviteCode(userId: string, inviteCode: string, timeZone?: string) {
     const [workspace] = await this.db
       .select()
       .from(workspaces)
@@ -430,6 +541,7 @@ export class WorkspaceService {
       name: joinUser?.name ?? null,
       avatar: joinUser?.avatar ?? null,
       theme: null,
+      timeZone: timeZone ?? null,
     })
 
     await this.channelService.ensureMembershipInDefaultChannel(
@@ -589,18 +701,18 @@ export class WorkspaceService {
         id: users.id,
         name: sql<
           string | null
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`,
         displayName: sql<
           string | null
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`,
         email: sql<string>`CASE WHEN ${workspaceMembers.id} IS NULL THEN '' ELSE ${users.email} END`,
         avatar: sql<
           string | null
         >`CASE WHEN ${workspaceMembers.id} IS NULL THEN NULL ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar}) END`,
         isAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         membershipStatus: sql<
-          'active' | 'deactivated'
-        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated' ELSE ${workspaceMembers.membershipStatus} END`,
+          'active' | 'deactivated' | 'deleted'
+        >`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deleted' ELSE ${workspaceMembers.membershipStatus} END`,
         namePronunciation: workspaceMembers.namePronunciation,
         phone: workspaceMembers.phone,
         description: workspaceMembers.description,
@@ -645,11 +757,6 @@ export class WorkspaceService {
             ? new Date(dto.statusExpiration)
             : null,
         }),
-        ...(dto.notificationsPausedUntil !== undefined && {
-          notificationsPausedUntil: dto.notificationsPausedUntil
-            ? new Date(dto.notificationsPausedUntil)
-            : null,
-        }),
       })
       .where(
         and(
@@ -668,7 +775,6 @@ export class WorkspaceService {
       statusText: updated.statusText,
       statusEmoji: updated.statusEmoji,
       statusExpiration: updated.statusExpiration,
-      notificationsPausedUntil: updated.notificationsPausedUntil,
       workspaceId,
     })
 
@@ -685,6 +791,7 @@ export class WorkspaceService {
         statusEmoji: null,
         statusExpiration: null,
         notificationsPausedUntil: null,
+        autoPaused: false,
       })
       .where(
         and(
@@ -704,6 +811,43 @@ export class WorkspaceService {
       statusEmoji: null,
       statusExpiration: null,
       notificationsPausedUntil: null,
+      autoPaused: false,
+      workspaceId,
+    })
+
+    return updated
+  }
+
+  async setNotificationPausedUntil(
+    userId: string,
+    workspaceId: string,
+    pausedUntil: string | null,
+    auto: boolean = false,
+  ) {
+    await this.assertActiveWorkspaceMember(workspaceId, userId)
+
+    const [updated] = await this.db
+      .update(workspaceMembers)
+      .set({
+        notificationsPausedUntil: pausedUntil ? new Date(pausedUntil) : null,
+        autoPaused: auto && pausedUntil !== null,
+      })
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          eq(workspaceMembers.userId, userId),
+        ),
+      )
+      .returning()
+
+    if (!updated) {
+      throw new NotFoundException('Workspace member not found')
+    }
+
+    this.profileBroadcastService.broadcastUserProfileUpdated(workspaceId, {
+      id: userId,
+      notificationsPausedUntil: updated.notificationsPausedUntil,
+      autoPaused: updated.autoPaused,
       workspaceId,
     })
 
@@ -1048,128 +1192,5 @@ export class WorkspaceService {
     )
 
     return row
-  }
-
-  async removeDeactivatedWorkspaceMember(
-    workspaceId: string,
-    requesterId: string,
-    targetUserId: string,
-  ) {
-    if (requesterId === targetUserId) {
-      throw new ForbiddenException('You cannot remove your own membership')
-    }
-
-    const requesterMembership = await this.getWorkspaceMembership(
-      workspaceId,
-      requesterId,
-    )
-
-    if (!requesterMembership) {
-      throw new ForbiddenException('You are not a member of this workspace')
-    }
-    if (requesterMembership.membershipStatus !== 'active') {
-      throw new ForbiddenException('Your workspace membership is deactivated')
-    }
-
-    await this.permissionsService.requireUserPermission(
-      workspaceId,
-      requesterId,
-      'manage_user_permissions',
-    )
-
-    const [targetMembership] = await this.db
-      .select({
-        id: workspaceMembers.id,
-        role: workspaceMembers.role,
-        membershipStatus: workspaceMembers.membershipStatus,
-      })
-      .from(workspaceMembers)
-      .where(
-        and(
-          eq(workspaceMembers.workspaceId, workspaceId),
-          eq(workspaceMembers.userId, targetUserId),
-        ),
-      )
-      .limit(1)
-
-    if (!targetMembership) {
-      throw new NotFoundException('Workspace member not found')
-    }
-
-    if (targetMembership.membershipStatus !== 'deactivated') {
-      throw new ForbiddenException('Only deactivated members can be removed')
-    }
-
-    await this.db.transaction(async (tx) => {
-      const channelRows = await tx
-        .select({ id: channels.id })
-        .from(channels)
-        .where(eq(channels.workspaceId, workspaceId))
-
-      const channelIds = channelRows.map((row) => row.id)
-      if (channelIds.length > 0) {
-        await tx
-          .delete(channelMembers)
-          .where(
-            and(
-              eq(channelMembers.userId, targetUserId),
-              inArray(channelMembers.channelId, channelIds),
-            ),
-          )
-      }
-
-      const conversationRows = await tx
-        .select({ id: directMessageConversations.id })
-        .from(directMessageConversations)
-        .where(eq(directMessageConversations.workspaceId, workspaceId))
-
-      const conversationIds = conversationRows.map((row) => row.id)
-      if (conversationIds.length > 0) {
-        await tx
-          .delete(conversationMembers)
-          .where(
-            and(
-              eq(conversationMembers.userId, targetUserId),
-              inArray(conversationMembers.conversationId, conversationIds),
-            ),
-          )
-      }
-
-      await tx
-        .delete(workspaceMembers)
-        .where(
-          and(
-            eq(workspaceMembers.workspaceId, workspaceId),
-            eq(workspaceMembers.userId, targetUserId),
-          ),
-        )
-    })
-
-    const payload = {
-      id: targetUserId,
-      userId: targetUserId,
-      workspaceId,
-      membershipStatus: 'deactivated',
-      removed: true,
-    }
-
-    this.profileBroadcastService.broadcastUserProfileUpdated(
-      workspaceId,
-      payload,
-    )
-    this.unifiedBroadcastService.syncEntity(
-      { workspaceId },
-      {
-        domain: EntityDomain.USER,
-        action: EntityAction.DELETE,
-        payload: {
-          id: targetUserId,
-          workspaceId,
-          data: payload,
-        },
-      },
-    )
-
-    return payload
   }
 }

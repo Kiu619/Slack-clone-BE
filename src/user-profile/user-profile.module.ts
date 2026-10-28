@@ -5,12 +5,14 @@ import { UserProfileBroadcastService } from './user-profile-broadcast.service'
 import { JwtModule } from '@nestjs/jwt'
 import { ChatModule } from '../chat/chat.module'
 import { WorkspacePermissionsModule } from '../workspace/workspace-permissions.module'
+import { WorkspaceMemberPreferencesModule } from '../workspace-member-preferences/workspace-member-preferences.module'
 
 @Module({
   imports: [
     JwtModule,
     forwardRef(() => ChatModule),
     WorkspacePermissionsModule,
+    forwardRef(() => WorkspaceMemberPreferencesModule),
   ],
   controllers: [UserProfileController],
   providers: [UserProfileService, UserProfileBroadcastService],

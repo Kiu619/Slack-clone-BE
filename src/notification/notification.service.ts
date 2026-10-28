@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import { Queue } from 'bullmq'
-import { and, desc, eq, gt, isNull, lt, ne, sql } from 'drizzle-orm'
+import { and, desc, eq, gt, inArray, isNull, lt, ne, sql } from 'drizzle-orm'
 import { AttachmentService } from '../attachment/attachment.service'
 import {
   EntityAction,
@@ -81,17 +81,100 @@ export class NotificationService {
     } = params
 
     const subscribers = await this.db
-      .select({ userId: schema.threadSubscriptions.userId })
+      .select({
+        userId: schema.threadSubscriptions.userId,
+        isMuted: schema.threadSubscriptions.isMuted,
+      })
       .from(schema.threadSubscriptions)
       .where(eq(schema.threadSubscriptions.parentMessageId, parentMessageId))
 
-    const targetUserIds = Array.from(
+    const rawTargetUserIds = Array.from(
       new Set(
         subscribers
           .map((subscriber) => subscriber.userId)
           .filter((userId) => userId !== actorId),
       ),
     )
+
+    // Build set of muted subscribers to exclude
+    const mutedUserIds = new Set(
+      subscribers
+        .filter((sub) => sub.isMuted && sub.userId !== actorId)
+        .map((sub) => sub.userId),
+    )
+
+    if (rawTargetUserIds.length === 0) return []
+
+    // Check notifyOnThreadReply settings for each subscriber
+    const members = await this.db
+      .select({
+        userId: schema.workspaceMembers.userId,
+        notifyOnThreadReply: schema.workspaceMembers.notifyOnThreadReply,
+      })
+      .from(schema.workspaceMembers)
+      .where(
+        and(
+          inArray(schema.workspaceMembers.userId, rawTargetUserIds),
+          eq(schema.workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
+
+    // Build map of userId -> global notifyOnThreadReply
+    const memberSettings = new Map(
+      members.map((m) => [m.userId, m.notifyOnThreadReply]),
+    )
+
+    // Check channel/conversation overrides if applicable
+    let overrideSettings = new Map<string, boolean | null>()
+    if (channelId || conversationId) {
+      const overrides = await this.db
+        .select({
+          userId: schema.channelNotificationOverrides.userId,
+          notifyOnThreadReply:
+            schema.channelNotificationOverrides.notifyOnThreadReply,
+        })
+        .from(schema.channelNotificationOverrides)
+        .where(
+          and(
+            inArray(
+              schema.channelNotificationOverrides.userId,
+              rawTargetUserIds,
+            ),
+            eq(
+              schema.channelNotificationOverrides.workspaceId,
+              workspaceId,
+            ),
+            channelId
+              ? eq(
+                  schema.channelNotificationOverrides.channelId,
+                  channelId,
+                )
+              : conversationId
+                ? eq(
+                    schema.channelNotificationOverrides.conversationId,
+                    conversationId,
+                  )
+                : undefined,
+          ),
+        )
+
+      overrideSettings = new Map(
+        overrides.map((o) => [o.userId, o.notifyOnThreadReply]),
+      )
+    }
+
+    // Filter users based on notifyOnThreadReply (override takes precedence) AND isMuted
+    const targetUserIds = rawTargetUserIds.filter((userId) => {
+      // Skip muted threads
+      if (mutedUserIds.has(userId)) return false
+
+      const override = overrideSettings.get(userId)
+      if (override !== undefined && override !== null) {
+        return override === true
+      }
+      const global = memberSettings.get(userId)
+      return global === undefined || global === true
+    })
 
     if (targetUserIds.length === 0) return []
 
@@ -252,10 +335,12 @@ export class NotificationService {
           id: actor.id,
           name: workspaceMember
             ? workspaceMember.displayName || workspaceMember.name || actor.name
-            : 'deactivated user',
+            : 'Deleted user',
           avatar: workspaceMember
             ? workspaceMember.avatar || actor.avatar
             : null,
+          // null khi workspaceMember không tồn tại → user đã bị xoá khỏi workspace
+          membershipStatus: workspaceMember?.membershipStatus ?? 'deleted',
         },
         message:
           row.message && !Array.isArray(row.message)
@@ -371,6 +456,41 @@ export class NotificationService {
     return updated
   }
 
+  async getGlobalSettings(userId: string, workspaceId: string) {
+    const [member] = await this.db
+      .select({
+        // Global notification preferences
+        notifyFor: schema.workspaceMembers.notifyFor,
+        notifyOnHereMention: schema.workspaceMembers.notifyOnHereMention,
+        notifyOnChannelMention: schema.workspaceMembers.notifyOnChannelMention,
+        notifyOnThreadReply: schema.workspaceMembers.notifyOnThreadReply,
+        notifyOnHuddle: schema.workspaceMembers.notifyOnHuddle,
+        // Browser notifications
+        desktopNotificationsEnabled: schema.workspaceMembers.desktopNotificationsEnabled,
+        // Sound preferences
+        soundEnabled: schema.workspaceMembers.soundEnabled,
+        soundType: schema.workspaceMembers.soundType,
+        messageSoundType: schema.workspaceMembers.messageSoundType,
+        huddleSoundType: schema.workspaceMembers.huddleSoundType,
+        // DND
+        dndEnabled: schema.workspaceMembers.dndEnabled,
+        dndStartHour: schema.workspaceMembers.dndStartHour,
+        dndEndHour: schema.workspaceMembers.dndEndHour,
+        dndTimezone: schema.workspaceMembers.dndTimezone,
+      })
+      .from(schema.workspaceMembers)
+      .where(
+        and(
+          eq(schema.workspaceMembers.userId, userId),
+          eq(schema.workspaceMembers.workspaceId, workspaceId),
+        ),
+      )
+      .limit(1)
+
+    if (!member) throw new NotFoundException('Workspace member not found')
+    return member
+  }
+
   async updateChannelOverride(
     userId: string,
     workspaceId: string,
@@ -420,6 +540,8 @@ export class NotificationService {
           muteChannel: dto.muteChannel ?? false,
           notifyFor: dto.notifyFor,
           mutedUntil: dto.mutedUntil ? new Date(dto.mutedUntil) : null,
+          notifyOnThreadReply: dto.notifyOnThreadReply,
+          notifyOnHuddle: dto.notifyOnHuddle,
         })
         .returning()
     }
@@ -476,6 +598,8 @@ export class NotificationService {
         notifyFor: schema.workspaceMembers.notifyFor,
         notifyOnHereMention: schema.workspaceMembers.notifyOnHereMention,
         notifyOnChannelMention: schema.workspaceMembers.notifyOnChannelMention,
+        notifyOnThreadReply: schema.workspaceMembers.notifyOnThreadReply,
+        notifyOnHuddle: schema.workspaceMembers.notifyOnHuddle,
       })
       .from(schema.workspaceMembers)
       .where(
@@ -496,6 +620,8 @@ export class NotificationService {
         notifyFor: schema.channelNotificationOverrides.notifyFor,
         muteChannel: schema.channelNotificationOverrides.muteChannel,
         mutedUntil: schema.channelNotificationOverrides.mutedUntil,
+        notifyOnThreadReply: schema.channelNotificationOverrides.notifyOnThreadReply,
+        notifyOnHuddle: schema.channelNotificationOverrides.notifyOnHuddle,
       })
       .from(schema.channelNotificationOverrides)
       .where(
@@ -537,8 +663,16 @@ export class NotificationService {
       notifyFor: effectiveNotifyFor,
       muteChannel: effectiveMute,
       mutedUntil: override?.mutedUntil ?? null,
+      notifyOnThreadReply: override?.notifyOnThreadReply ?? member.notifyOnThreadReply,
+      notifyOnHuddle: override?.notifyOnHuddle ?? member.notifyOnHuddle,
       override: override ?? null,
-      defaults: member,
+      defaults: {
+        notifyFor: member.notifyFor,
+        notifyOnHereMention: member.notifyOnHereMention,
+        notifyOnChannelMention: member.notifyOnChannelMention,
+        notifyOnThreadReply: member.notifyOnThreadReply,
+        notifyOnHuddle: member.notifyOnHuddle,
+      },
     }
   }
 
@@ -649,6 +783,74 @@ export class NotificationService {
           eq(schema.conversationMembers.userId, userId),
         ),
       )
+    if (conversation?.workspaceId) {
+      this.broadcastNotificationChanged(userId, conversation.workspaceId)
+    }
+    return { success: true }
+  }
+
+  async markChannelAsUnread(userId: string, channelId: string, messageId: string) {
+    // Get the message's createdAt to set as lastReadAt
+    const [message] = await this.db
+      .select({ createdAt: schema.messages.createdAt })
+      .from(schema.messages)
+      .where(eq(schema.messages.id, messageId))
+      .limit(1)
+
+    if (!message) {
+      throw new NotFoundException('Message not found')
+    }
+
+    const [channel] = await this.db
+      .select({ workspaceId: schema.channels.workspaceId })
+      .from(schema.channels)
+      .where(eq(schema.channels.id, channelId))
+      .limit(1)
+
+    await this.db
+      .update(schema.channelMembers)
+      .set({ lastReadAt: message.createdAt })
+      .where(
+        and(
+          eq(schema.channelMembers.channelId, channelId),
+          eq(schema.channelMembers.userId, userId),
+        ),
+      )
+
+    if (channel?.workspaceId) {
+      this.broadcastNotificationChanged(userId, channel.workspaceId)
+    }
+    return { success: true }
+  }
+
+  async markConversationAsUnread(userId: string, conversationId: string, messageId: string) {
+    // Get the message's createdAt to set as lastReadAt
+    const [message] = await this.db
+      .select({ createdAt: schema.messages.createdAt })
+      .from(schema.messages)
+      .where(eq(schema.messages.id, messageId))
+      .limit(1)
+
+    if (!message) {
+      throw new NotFoundException('Message not found')
+    }
+
+    const [conversation] = await this.db
+      .select({ workspaceId: schema.directMessageConversations.workspaceId })
+      .from(schema.directMessageConversations)
+      .where(eq(schema.directMessageConversations.id, conversationId))
+      .limit(1)
+
+    await this.db
+      .update(schema.conversationMembers)
+      .set({ lastReadAt: message.createdAt })
+      .where(
+        and(
+          eq(schema.conversationMembers.conversationId, conversationId),
+          eq(schema.conversationMembers.userId, userId),
+        ),
+      )
+
     if (conversation?.workspaceId) {
       this.broadcastNotificationChanged(userId, conversation.workspaceId)
     }

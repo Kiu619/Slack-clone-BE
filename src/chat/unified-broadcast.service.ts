@@ -5,6 +5,7 @@ export enum EntityDomain {
   CHAT = 'CHAT',
   USER = 'USER',
   CHANNEL = 'CHANNEL',
+  DM_CONVERSATION = 'DM_CONVERSATION',
   NOTIFICATION = 'NOTIFICATION',
   EMOJI = 'EMOJI',
 }

@@ -11,20 +11,42 @@ export const CreateMessageSchema = z
     userIds: z.array(z.string().uuid()).optional(),
     /** workspaceId: dùng kèm với userIds */
     workspaceId: z.string().uuid().optional(),
-    /** attachments: danh sách file đính kèm đã upload lên S3/Cloudinary */
+    /** attachments: danh sách file đính kèm đã upload lên S3/Cloudinary.
+     *
+     * Optimistic upload pattern:
+     * - Client tạo message + attachment rows NGAY khi user bấm Send (không cần URL thật).
+     * - Server lưu tạm attachment row với `url=''` + `pendingUploadId` (client-generated).
+     * - Sau khi upload xong, client gọi `POST /messages/:id/attachments/:pendingUploadId/finalize`
+     *   để update URL thật.
+     *
+     * Vì vậy `url` chỉ BẮT BUỘC khi `pendingUpload !== true`.
+     */
     attachments: z
       .array(
-        z.object({
-          url: z.string().url(),
-          type: z.enum(['image', 'video', 'audio', 'file']),
-          name: z.string(),
-          size: z.number(),
-          mimeType: z.string().optional(),
-          width: z.number().optional(),
-          height: z.number().optional(),
-          duration: z.number().optional(),
-          fileCategory: z.string().optional(),
-        }),
+        z
+          .object({
+            url: z.string().optional(),
+            type: z.enum(['image', 'video', 'audio', 'file']),
+            name: z.string(),
+            size: z.number(),
+            mimeType: z.string().optional(),
+            width: z.number().optional(),
+            height: z.number().optional(),
+            duration: z.number().optional(),
+            fileCategory: z.string().optional(),
+            /** Client-generated uploadId (Math.random), dùng để map progress + retry + finalize. */
+            pendingUploadId: z.string().optional(),
+            /** Đánh dấu attachment chưa có URL thật (server lưu tạm với url rỗng). */
+            pendingUpload: z.boolean().optional(),
+          })
+          .refine(
+            (a) =>
+              a.pendingUpload === true || (typeof a.url === 'string' && a.url.length > 0),
+            {
+              message: 'url là bắt buộc khi không phải pendingUpload',
+              path: ['url'],
+            },
+          ),
       )
       .optional(),
   })
@@ -43,20 +65,42 @@ export type CreateMessageDto = z.infer<typeof CreateMessageSchema>
 export const UpdateMessageSchema = z
   .object({
     content: z.string().max(40000).optional(),
-    /** attachments: danh sách file đính kèm mới đã upload */
+    /** attachments: danh sách attachment mới cần UPDATE.
+     *
+     * Optimistic upload pattern (giống Create):
+     * - Client build optimistic attachments NGAY khi user nhấn Save (không cần URL thật).
+     * - Server lưu tạm attachment row với `url=''` + `pendingUploadId` (client-generated).
+     * - Sau khi upload xong, client gọi `POST /messages/:id/attachments/:pendingUploadId/finalize`
+     *   để update URL thật.
+     *
+     * Vì vậy `url` chỉ BẮT BUỘC khi `pendingUpload !== true`. */
     attachments: z
       .array(
-        z.object({
-          url: z.string().url(),
-          type: z.enum(['image', 'video', 'audio', 'file']),
-          name: z.string(),
-          size: z.number(),
-          mimeType: z.string().optional(),
-          width: z.number().optional(),
-          height: z.number().optional(),
-          duration: z.number().optional(),
-          fileCategory: z.string().optional(),
-        }),
+        z
+          .object({
+            url: z.string().url().optional(),
+            type: z.enum(['image', 'video', 'audio', 'file']),
+            name: z.string(),
+            size: z.number(),
+            mimeType: z.string().optional(),
+            width: z.number().optional(),
+            height: z.number().optional(),
+            duration: z.number().optional(),
+            fileCategory: z.string().optional(),
+            /** Client-generated uploadId, dùng để match attachment row khi finalize. */
+            pendingUploadId: z.string().optional(),
+            /** Đánh dấu attachment chưa có URL thật (server lưu tạm với url rỗng). */
+            pendingUpload: z.boolean().optional(),
+          })
+          .refine(
+            (a) =>
+              a.pendingUpload === true ||
+              (typeof a.url === 'string' && a.url.length > 0),
+            {
+              message: 'url là bắt buộc khi không phải pendingUpload',
+              path: ['url'],
+            },
+          ),
       )
       .optional(),
     /** deletedAttachmentIds: danh sách ID attachments muốn xóa */

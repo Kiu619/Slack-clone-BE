@@ -31,9 +31,9 @@ import { randomUUID } from 'crypto'
 @Injectable()
 export class S3Service implements OnModuleInit {
   private readonly logger = new Logger(S3Service.name)
-  private s3Client: S3Client
-  private bucketName: string
-  private folderPrefix: string
+  private s3Client!: S3Client
+  private bucketName!: string
+  private folderPrefix!: string
 
   /** Max file size: 50MB */
   private readonly MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -76,6 +76,7 @@ export class S3Service implements OnModuleInit {
     '.wav',
     '.ogg',
     '.m4a',
+    '.webm',
   ]
 
   constructor(private config: ConfigService) {}

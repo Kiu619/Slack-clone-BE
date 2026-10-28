@@ -13,6 +13,7 @@ import type { UpdateAboutMeDto } from './dto/update-about-me.dto'
 import { RedisService } from '../redis/redis.service'
 import { UserProfileBroadcastService } from './user-profile-broadcast.service'
 import { WorkspacePermissionsService } from '../workspace/workspace-permissions.service'
+import { WorkspaceMemberPreferencesService } from '../workspace-member-preferences/workspace-member-preferences.service'
 
 @Injectable()
 export class UserProfileService {
@@ -21,6 +22,7 @@ export class UserProfileService {
     private readonly redis: RedisService,
     private readonly profileBroadcastService: UserProfileBroadcastService,
     private readonly permissionsService: WorkspacePermissionsService,
+    private readonly preferencesService: WorkspaceMemberPreferencesService,
   ) {}
 
   private async assertWorkspaceMember(workspaceId: string, userId: string) {
@@ -149,6 +151,15 @@ export class UserProfileService {
     if (!updated) throw new NotFoundException('Workspace member not found')
 
     await this.invalidateProfileCache(workspaceId, userId)
+
+    const prefsPayload = {
+      ...(dto.locale !== undefined && { locale: dto.locale }),
+      ...(dto.timeFormat !== undefined && { timeFormat: dto.timeFormat }),
+    }
+
+    if (Object.keys(prefsPayload).length > 0) {
+      await this.preferencesService.upsertPreferences(workspaceId, userId, prefsPayload)
+    }
 
     const [row] = await this.db
       .select({
@@ -333,7 +344,7 @@ export class UserProfileService {
     wmAvatar: string | null
     displayName: string | null
     role: 'owner' | 'admin' | 'member' | 'primary_owner'
-    membershipStatus: 'active' | 'deactivated'
+    membershipStatus: 'active' | 'deactivated' | 'deleted'
     isAway: boolean
     namePronunciation: string | null
     phone: string | null

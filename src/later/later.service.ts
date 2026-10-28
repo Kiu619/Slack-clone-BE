@@ -1,9 +1,12 @@
 import {
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
   forwardRef,
 } from '@nestjs/common'
+import { InjectQueue } from '@nestjs/bullmq'
+import { Queue } from 'bullmq'
 import { randomUUID } from 'crypto'
 import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import { DRIZZLE, type DrizzleDB } from '../database/database.module'
@@ -21,20 +24,98 @@ import type { SaveItemDto, UpdateLaterItemDto } from './dto/later.dto'
 import { MessageService } from '../message/message.service'
 import { ChatBroadcastService } from '../chat/chat-broadcast.service'
 
+/**
+ * BullMQ hard cap for delayed jobs (≈24.8 days, the max signed 32-bit int
+ * in milliseconds). Anything further out is clamped to this value; the
+ * processor's reminderFiredAt guard then ensures we don't notify prematurely.
+ */
+const BULL_DELAY_MAX = 2147483647
+
+/** Stable BullMQ jobId per saved-item id — re-scheduling replaces the old job. */
+function jobIdForSavedItem(id: string) {
+  return `later-reminder-${id}`
+}
+
 @Injectable()
 export class LaterService {
+  private readonly logger = new Logger(LaterService.name)
+
   constructor(
     @Inject(DRIZZLE) private readonly db: DrizzleDB,
     private readonly s3Service: S3Service,
     @Inject(forwardRef(() => MessageService))
     private readonly messageService: MessageService,
     private readonly broadcastService: ChatBroadcastService,
+    @InjectQueue('later-reminders')
+    private readonly reminderQueue: Queue,
   ) {}
+
+  /**
+   * (Re)schedule a BullMQ job for the reminder time of a saved item.
+   * Uses the saved-item id as the BullMQ jobId, so re-scheduling is
+   * idempotent — old jobs for the same item are replaced, not duplicated.
+   * No-op when `remindAt` is missing/in the past (the processor will pick
+   * up missed reminders immediately thanks to its `remindAt <= NOW()` guard
+   * combined with the partial index).
+   */
+  private async scheduleReminderJob(item: {
+    id: string
+    remindAt: Date | string | null
+  }): Promise<void> {
+    if (!item.remindAt) return
+    const remindAt =
+      item.remindAt instanceof Date ? item.remindAt : new Date(item.remindAt)
+    if (Number.isNaN(remindAt.getTime())) return
+
+    const delay = Math.min(
+      Math.max(remindAt.getTime() - Date.now(), 0),
+      BULL_DELAY_MAX,
+    )
+    try {
+      await this.reminderQueue.add(
+        'fire-reminder',
+        { savedItemId: item.id },
+        {
+          delay,
+          jobId: jobIdForSavedItem(item.id),
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 2000 },
+          removeOnComplete: true,
+        },
+      )
+    } catch (e) {
+      // Don't fail the user-facing mutation if BullMQ is briefly unavailable;
+      // the processor's idempotency guarantees no double-fire on retry.
+      const msg = e instanceof Error ? e.message : String(e)
+      this.logger.error(
+        `Failed to schedule reminder for ${item.id}: ${msg}`,
+      )
+    }
+  }
+
+  /**
+   * Cancel a previously-scheduled reminder. Safe to call even when no job
+   * exists (e.g. item was just inserted with no remindAt yet, or the user
+   * already completed the reminder).
+   */
+  private async cancelReminderJob(itemId: string): Promise<void> {
+    try {
+      const job = await this.reminderQueue.getJob(jobIdForSavedItem(itemId))
+      if (job) await job.remove()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      this.logger.warn(`Failed to cancel reminder ${itemId}: ${msg}`)
+    }
+  }
 
   /**
    * Chuyển S3 URL thành presigned URL (signed URL)
    */
-  private async getSignedUrl(url: string, name?: string): Promise<string> {
+  private async getSignedUrl(
+    url: string | null,
+    name?: string,
+  ): Promise<string | null> {
+    if (!url) return url
     const key = this.s3Service.parseS3KeyFromUrl(url)
     if (!key) return url
     try {
@@ -45,8 +126,13 @@ export class LaterService {
   }
 
   /**
-   * Single round-trip for POST check-messages: which message IDs are in Later
-   * (in_progress, message or attachment save) and the soonest non-null remindAt per message.
+   * Single round-trip for POST check-messages:
+   * - savedMessageIds: message IDs that are directly saved (type='message')
+   * - remindAtByMessageId: earliest reminder time for each directly-saved message
+   * - savedAttachmentIds: attachment IDs that are saved (type='attachment')
+   *
+   * Note: attachments and messages are tracked SEPARATELY. Saving an attachment
+   * does NOT cause its parent message to appear in savedMessageIds.
    */
   async checkLaterMessagesForUser(
     userId: string,
@@ -55,9 +141,10 @@ export class LaterService {
   ): Promise<{
     savedMessageIds: string[]
     remindAtByMessageId: Record<string, string>
+    savedAttachmentIds: string[]
   }> {
     if (messageIds.length === 0) {
-      return { savedMessageIds: [], remindAtByMessageId: {} }
+      return { savedMessageIds: [], remindAtByMessageId: {}, savedAttachmentIds: [] }
     }
 
     const idList = sql.join(
@@ -65,40 +152,28 @@ export class LaterService {
       sql`, `,
     )
 
-    const rows = await this.db.execute(sql`
-      WITH unioned AS (
-        SELECT si.message_id AS message_id, si.remind_at AS remind_at
-        FROM saved_items si
-        WHERE si.user_id = ${userId}
-          AND si.workspace_id = ${workspaceId}
-          AND si.status = 'in_progress'
-          AND si.type = 'message'
-          AND si.message_id IS NOT NULL
-          AND si.message_id IN (${idList})
-        UNION ALL
-        SELECT a.message_id AS message_id, si.remind_at AS remind_at
-        FROM saved_items si
-        INNER JOIN attachments a ON si.attachment_id = a.id
-        WHERE si.user_id = ${userId}
-          AND si.workspace_id = ${workspaceId}
-          AND si.status = 'in_progress'
-          AND si.type = 'attachment'
-          AND si.attachment_id IS NOT NULL
-          AND a.message_id IN (${idList})
-      )
-      SELECT message_id::text AS "messageId",
-        (MIN(remind_at) FILTER (WHERE remind_at IS NOT NULL)) AS "soonestRemind"
-      FROM unioned
-      GROUP BY message_id
+    // Query 1: only directly-saved messages (type='message')
+    const messageRows = await this.db.execute(sql`
+      SELECT
+        si.message_id::text AS "messageId",
+        (MIN(si.remind_at) FILTER (WHERE si.remind_at IS NOT NULL)) AS "soonestRemind"
+      FROM saved_items si
+      WHERE si.user_id = ${userId}
+        AND si.workspace_id = ${workspaceId}
+        AND si.status = 'in_progress'
+        AND si.type = 'message'
+        AND si.message_id IS NOT NULL
+        AND si.message_id IN (${idList})
+      GROUP BY si.message_id
     `)
 
-    type Row = { messageId: string; soonestRemind: Date | string | null }
-    const list = rows as unknown as Row[]
+    type MessageRow = { messageId: string; soonestRemind: Date | string | null }
+    const messageList = messageRows as unknown as MessageRow[]
 
     const savedMessageIds: string[] = []
     const remindAtByMessageId: Record<string, string> = {}
 
-    for (const r of list) {
+    for (const r of messageList) {
       if (!r?.messageId) continue
       savedMessageIds.push(r.messageId)
       if (r.soonestRemind != null) {
@@ -112,7 +187,26 @@ export class LaterService {
       }
     }
 
-    return { savedMessageIds, remindAtByMessageId }
+    // Query 2: saved attachments whose parent message is in the idList
+    const attachmentRows = await this.db.execute(sql`
+      SELECT si.attachment_id::text AS "attachmentId"
+      FROM saved_items si
+      INNER JOIN attachments a ON si.attachment_id = a.id
+      WHERE si.user_id = ${userId}
+        AND si.workspace_id = ${workspaceId}
+        AND si.status = 'in_progress'
+        AND si.type = 'attachment'
+        AND si.attachment_id IS NOT NULL
+        AND a.message_id IN (${idList})
+    `)
+
+    type AttachmentRow = { attachmentId: string }
+    const attachmentList = attachmentRows as unknown as AttachmentRow[]
+    const savedAttachmentIds = attachmentList
+      .map((r) => r?.attachmentId)
+      .filter(Boolean)
+
+    return { savedMessageIds, remindAtByMessageId, savedAttachmentIds }
   }
 
   /**
@@ -159,6 +253,35 @@ export class LaterService {
         ...attachmentRows.map((r) => r.id),
       ]),
     ]
+    for (const itemId of ids) {
+      await this.removeItem(userId, itemId)
+    }
+    return { success: true, removed: ids.length }
+  }
+
+  /**
+   * Remove all in_progress Later rows for a specific attachment.
+   * Used when user clicks "Remove from Later" on an attachment in FileToolbar.
+   */
+  async removeInProgressItemsForAttachment(
+    userId: string,
+    workspaceId: string,
+    attachmentId: string,
+  ): Promise<{ success: true; removed: number }> {
+    const rows = await this.db
+      .select({ id: savedItems.id })
+      .from(savedItems)
+      .where(
+        and(
+          eq(savedItems.userId, userId),
+          eq(savedItems.workspaceId, workspaceId),
+          eq(savedItems.status, 'in_progress'),
+          eq(savedItems.type, 'attachment'),
+          eq(savedItems.attachmentId, attachmentId),
+        ),
+      )
+
+    const ids = rows.map((r) => r.id)
     for (const itemId of ids) {
       await this.removeItem(userId, itemId)
     }
@@ -212,6 +335,8 @@ export class LaterService {
       })
 
     for (const row of deletedRows) {
+      // Best-effort cancel any pending reminder job for the purged row.
+      void this.cancelReminderJob(row.id)
       this.broadcastService.broadcastToUser(
         row.userId,
         row.workspaceId,
@@ -246,6 +371,7 @@ export class LaterService {
       })
 
     for (const row of deletedRows) {
+      void this.cancelReminderJob(row.id)
       this.broadcastService.broadcastToUser(
         row.userId,
         row.workspaceId,
@@ -296,6 +422,7 @@ export class LaterService {
               'later:updated',
               updated,
             )
+            await this.scheduleReminderJob(updated)
             return updated
           }
         }
@@ -325,6 +452,7 @@ export class LaterService {
         'later:updated',
         newItem,
       )
+      await this.scheduleReminderJob(newItem)
     }
     return newItem
   }
@@ -337,6 +465,9 @@ export class LaterService {
 
     if (!deleted)
       throw new NotFoundException('Item not found in your Later list')
+    // Best-effort: cancel any pending reminder job for this item so we don't
+    // broadcast `later:due` for a deleted row.
+    await this.cancelReminderJob(itemId)
     this.broadcastService.broadcastToUser(
       userId,
       deleted.workspaceId,
@@ -391,6 +522,16 @@ export class LaterService {
       .returning()
 
     if (!updated) throw new NotFoundException('Item not found')
+    // Reschedule the BullMQ reminder based on the latest state:
+    //  - status flipped away from `in_progress` (completed/archived) → cancel
+    //  - `remindAt` cleared (null)                       → cancel
+    //  - `remindAt` is still set and status is in_progress → re-schedule
+    const isActive = updated.status === 'in_progress'
+    if (!isActive || !updated.remindAt) {
+      await this.cancelReminderJob(itemId)
+    } else {
+      await this.scheduleReminderJob(updated)
+    }
     this.broadcastService.broadcastToUser(
       userId,
       updated.workspaceId,
@@ -467,13 +608,15 @@ export class LaterService {
     let whereClause = baseWhereClause
 
     if (cursor) {
-      const [pStr, tsStr] = cursor.split(':')
+      const colonIdx = cursor.indexOf(':')
+      const pStr = cursor.slice(0, colonIdx)
+      const tsStr = cursor.slice(colonIdx + 1)
       const p = parseInt(pStr, 10)
       const ts = new Date(tsStr)
 
       whereClause = and(
         whereClause,
-        sql`(${prioritySql} > ${p} OR (${prioritySql} = ${p} AND ${savedItems.createdAt} < ${ts}))`,
+        sql`(${prioritySql} > ${p} OR (${prioritySql} = ${p} AND ${savedItems.createdAt} < ${ts.toISOString()}))`,
       )
     }
 
@@ -632,11 +775,11 @@ export class LaterService {
                 id: att.user.id,
                 name:
                   att.user.wmId == null
-                    ? 'deactivated user'
+                    ? 'Deleted user'
                     : att.user.wmName || att.user.name,
                 displayName:
                   att.user.wmId == null
-                    ? 'deactivated user'
+                    ? 'Deleted user'
                     : att.user.displayName,
                 avatar:
                   att.user.wmId == null
@@ -656,8 +799,8 @@ export class LaterService {
           if (u) {
             user = {
               id: u.id,
-              name: u.wmId == null ? 'deactivated user' : u.wmName || u.name,
-              displayName: u.wmId == null ? 'deactivated user' : u.displayName,
+              name: u.wmId == null ? 'Deleted user' : u.wmName || u.name,
+              displayName: u.wmId == null ? 'Deleted user' : u.displayName,
               avatar: u.wmId == null ? null : u.wmAvatar || u.avatar,
             }
           }

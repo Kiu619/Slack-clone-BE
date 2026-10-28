@@ -17,8 +17,10 @@ import {
   gt,
   ilike,
   inArray,
+  isNotNull,
   isNull,
   lt,
+  lte,
   ne,
   or,
   sql,
@@ -53,6 +55,7 @@ import type {
   UpdateMessageDto,
 } from './dto/create-message.dto'
 import type { ForwardMessageDto } from './dto/forward-message.dto'
+import type { FinalizeAttachmentDto } from './dto/finalize-attachment.dto'
 import type { SearchWorkspaceMessagesDto } from './dto/search-workspace-messages.dto'
 
 const PAGE_SIZE = 20
@@ -67,15 +70,42 @@ const CHANNEL_FILES_PAGE_SIZE = 30
  */
 const MESSAGE_CACHE_TTL = 30
 
-const removedAuthorNameExpr = sql<
+// Display name + avatar cho author tuỳ theo trạng thái membership trong workspace.
+//
+// Khi user KHÔNG còn active trong workspace, message/reaction/group DM name hiển thị
+// "Deactivated user" thay vì tên thật. Khi user được reactivate, name thật quay lại.
+//
+// - active:      tên thật (COALESCE từ workspace_members → users)
+// - deactivated: "Deactivated user" (mask name + avatar)
+// - deleted:     "Deleted user" (row không còn, chỉ xảy ra với data cũ pre-plan)
+const maskedAuthorNameExpr = sql<
   string | null
->`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.name}, ${users.name}) END`
-const removedAuthorDisplayNameExpr = sql<
+>`CASE
+  WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+  WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+  ELSE COALESCE(${workspaceMembers.name}, ${users.name})
+END`
+const maskedAuthorDisplayNameExpr = sql<
   string | null
->`CASE WHEN ${workspaceMembers.id} IS NULL THEN 'deactivated user' ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name}) END`
-const removedAuthorAvatarExpr = sql<
+>`CASE
+  WHEN ${workspaceMembers.id} IS NULL THEN 'Deleted user'
+  WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'Deactivated user'
+  ELSE COALESCE(${workspaceMembers.displayName}, ${workspaceMembers.name}, ${users.name})
+END`
+const maskedAuthorAvatarExpr = sql<
   string | null
->`CASE WHEN ${workspaceMembers.id} IS NULL THEN NULL ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar}) END`
+>`CASE
+  WHEN ${workspaceMembers.id} IS NULL THEN NULL
+  WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN NULL
+  ELSE COALESCE(${workspaceMembers.avatar}, ${users.avatar})
+END`
+const maskedAuthorStatusExpr = sql<
+  'active' | 'deactivated' | 'deleted'
+>`CASE
+  WHEN ${workspaceMembers.id} IS NULL THEN 'deleted'
+  WHEN ${workspaceMembers.membershipStatus} = 'deactivated' THEN 'deactivated'
+  ELSE 'active'
+END`
 
 type MessageJoinRow = {
   id: string
@@ -109,6 +139,7 @@ type MessageJoinRow = {
   userPhone: string | null
   userDescription: string | null
   userTimeZone: string | null
+  userMembershipStatus?: 'active' | 'deactivated' | 'deleted' | null
   parentContent?: string | null
   parentDeletedAt?: Date | null
   forwardSnapshot?: unknown | null
@@ -158,6 +189,7 @@ type ChannelFileJoinRow = {
   userTimeZone: string | null
   userStatus: string | null
   userStatusEmoji: string | null
+  userMembershipStatus?: 'active' | 'deactivated' | 'deleted' | null
 }
 
 type ReactionUserSnapshot = {
@@ -213,18 +245,21 @@ export class MessageService {
    * Truyền att.name để Content-Disposition đúng tên tiếng Việt khi download.
    */
   private async enrichAttachmentWithSignedUrl<
-    T extends { url: string; name?: string },
+    T extends { url: string | null; name?: string },
   >(att: T): Promise<T> {
+    // Pending upload: chưa có URL thật → trả về nguyên row, không cần sign.
+    if (!att.url) return att
     const key = this.s3Service.parseS3KeyFromUrl(att.url)
-    if (!key) return att
+    if (!key) {
+      this.logger.debug(`[enrich] parseS3KeyFromUrl returned null for URL: ${att.url}`)
+      return att
+    }
     try {
-      const signedUrl = await this.s3Service.getPresignedGetUrl(
-        key,
-        86400,
-        att.name,
-      )
+      const signedUrl = await this.s3Service.getPresignedGetUrl(key, 86400, att.name)
+      this.logger.debug(`[enrich] key="${key}" → URL length=${signedUrl.length}, first 120: ${signedUrl.substring(0, 120)}`)
       return { ...att, url: signedUrl }
-    } catch {
+    } catch (err) {
+      this.logger.error(`[enrich] failed to generate signed URL: ${(err as Error).message}`)
       return att
     }
   }
@@ -288,32 +323,237 @@ export class MessageService {
   }
 
   /**
-   * Đi theo chuỗi forward_snapshot tới message gốc (tối đa 10 bước) để snapshot tin forward mới trỏ đúng tác giả/nội dung.
+   * resolveForwardedSourceUsers
+   *
+   * Resolve `sourceUser` cho tất cả các forwardSnapshot trong list messages.
+   *
+   * Vấn đề giải quyết:
+   * Trước đây snapshot đông cứng full user object tại thời điểm forward. Khi user
+   * bị hard-delete khỏi workspace_members SAU khi forward, snapshot vẫn giữ tên
+   * và avatar cũ → bug UI: forwarded message hiển thị user đã xoá với tên thật.
+   *
+   * Hướng mới:
+   * - Snapshot mới chỉ lưu `sourceMessageId` (xem resolveForwardSnapshotForOutgoingForward)
+   * - Khi đọc list messages, lấy tất cả `sourceMessageId` thiếu `sourceUser` rồi
+   *   query 1 lần (batch) với cùng CASE expressions (removedAuthor*) → luôn nhận
+   *   name/avatar/status HIỆN TẠI của source author (deleted → "Deleted user")
+   *
+   * Tối ưu:
+   * - 1 query SQL batch thay vì N+1
+   * - Cache `getMessageById` tận dụng được (cùng formatMessageRow + CASE expressions)
+   * - Backward-compat: snapshot CŨ đã có `sourceUser` đầy đủ → giữ nguyên,
+   *   không cần query lại. Tránh breaking change với dữ liệu đã tồn tại.
+   *
+   * @param messages - List messages (sẽ mutate forwardSnapshot của từng message)
+   * @returns void - mutate messages[i].forwardSnapshot.sourceUser
+   */
+  async resolveForwardedSources(
+    msgs: Array<{ forwardSnapshot?: Record<string, unknown> | null }>,
+  ): Promise<void> {
+    return this.resolveForwardedSourceUsers(msgs)
+  }
+
+  private async resolveForwardedSourceUsers(
+    msgs: Array<{ forwardSnapshot?: Record<string, unknown> | null }>,
+  ): Promise<void> {
+    if (!msgs || msgs.length === 0) return
+
+    // Lấy tất cả sourceMessageId cần resolve (snapshot thiếu sourceUser hợp lệ)
+    const idsToResolve: string[] = []
+    const indexBySourceId = new Map<string, number[]>() // sourceId -> indices trong msgs
+    for (let i = 0; i < msgs.length; i++) {
+      const snap = msgs[i].forwardSnapshot
+      if (!snap || typeof snap !== 'object') continue
+      const sourceId =
+        typeof snap.sourceMessageId === 'string'
+          ? snap.sourceMessageId
+          : null
+      if (!sourceId) continue
+      // Source user hợp lệ = object có membershipStatus (từ snapshot CŨ đã lưu)
+      const sourceUser = snap.sourceUser
+      const hasValidSourceUser =
+        sourceUser &&
+        typeof sourceUser === 'object' &&
+        'membershipStatus' in (sourceUser as Record<string, unknown>)
+      if (hasValidSourceUser) continue
+      idsToResolve.push(sourceId)
+      const list = indexBySourceId.get(sourceId) ?? []
+      list.push(i)
+      indexBySourceId.set(sourceId, list)
+    }
+
+    if (idsToResolve.length === 0) return
+
+    // Batch fetch: 1 query duy nhất cho tất cả source messages.
+    // Tận dụng CASE expressions (removedAuthor*) đã có ở trên file này.
+    // workspace_id của message nằm ở channels.workspace_id hoặc
+    // direct_message_conversations.workspace_id → dùng COALESCE qua LEFT JOIN.
+    const rows = await this.db
+      .select({
+        id: messages.id,
+        workspaceId: sql<
+          string | null
+        >`COALESCE(${channels.workspaceId}, ${directMessageConversations.workspaceId})`,
+        userId: users.id,
+        userEmail: users.email,
+        userName: maskedAuthorNameExpr,
+        userAvatar: maskedAuthorAvatarExpr,
+        userDisplayName: maskedAuthorDisplayNameExpr,
+        userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
+        userStatus: workspaceMembers.statusText,
+        userStatusEmoji: workspaceMembers.statusEmoji,
+        userNamePronunciation: workspaceMembers.namePronunciation,
+        userMembershipStatus: maskedAuthorStatusExpr,
+      })
+      .from(messages)
+      .innerJoin(users, eq(users.id, messages.userId))
+      .leftJoin(channels, eq(channels.id, messages.channelId))
+      .leftJoin(
+        directMessageConversations,
+        eq(directMessageConversations.id, messages.conversationId),
+      )
+      .leftJoin(
+        workspaceMembers,
+        and(
+          eq(workspaceMembers.userId, users.id),
+          sql`${workspaceMembers.workspaceId} = COALESCE(${channels.workspaceId}, ${directMessageConversations.workspaceId})`,
+        ),
+      )
+      .where(inArray(messages.id, idsToResolve))
+
+    // Map sourceId → sourceUser object (format giống MessageJoinRow.user)
+    const sourceUserById = new Map<string, Record<string, unknown>>()
+    for (const row of rows) {
+      const wsId = (row as { workspaceId: string | null }).workspaceId
+      // Nếu không có workspaceId (orphan message), vẫn build user nhưng
+      // membershipStatus fallback 'active' (giống formatMessageRow behavior).
+      sourceUserById.set(row.id, {
+        id: row.userId,
+        name: row.userName,
+        avatar: row.userAvatar,
+        email: row.userEmail,
+        displayName: row.userDisplayName,
+        isAway: row.userIsAway,
+        status: row.userStatus,
+        statusText: row.userStatus,
+        statusEmoji: row.userStatusEmoji,
+        namePronunciation: row.userNamePronunciation,
+        membershipStatus: row.userMembershipStatus ?? 'active',
+        // Metadata giúp debug nếu cần
+        _workspaceId: wsId,
+      } as unknown as Record<string, unknown>)
+    }
+
+    // Gắn sourceUser vào từng snapshot theo index
+    for (const [sourceId, indices] of indexBySourceId) {
+      const sourceUser = sourceUserById.get(sourceId)
+      // sourceUser có thể null nếu source message đã bị hard-delete
+      // → FE fallback 'Deleted user'
+      for (const idx of indices) {
+        const snap = msgs[idx].forwardSnapshot as Record<string, unknown>
+        snap.sourceUser = sourceUser ?? null
+      }
+    }
+  }
+
+  /**
+   * formatMessagesAndResolveForwardSources
+   *
+   * Helper gộp 2 bước cho các list endpoints:
+   * 1. Format tất cả rows qua formatMessageRow (Promise.all song song)
+   * 2. Resolve sourceUser cho forwardSnapshot (1 batch query)
+   *
+   * Dùng ở mọi nơi trả về danh sách messages để đảm bảo snapshot forward
+   * luôn có sourceUser mới nhất (deleted users → "Deleted user").
+   */
+  private async formatMessagesAndResolveForwardSources(
+    rows: MessageJoinRow[],
+    reactionsByMessage: Record<string, ReactionSnapshot[]>,
+    attachmentsMap: Map<string, any[]>,
+    viewerMutedMap: Map<string, boolean>,
+  ): Promise<Array<{ id: string; forwardSnapshot?: Record<string, unknown> | null } & Record<string, any>>> {
+    const formatted = await Promise.all(
+      rows.map((row) =>
+        this.formatMessageRow(
+          row,
+          reactionsByMessage,
+          attachmentsMap,
+          viewerMutedMap,
+        ),
+      ),
+    )
+    // Backward-compat: nếu snapshot đã có sourceUser hợp lệ → keep as is.
+    // Nếu thiếu (snapshot MỚI chỉ có sourceMessageId) → batch query từ DB.
+    await this.resolveForwardedSourceUsers(formatted)
+    return formatted as Array<{ id: string; forwardSnapshot?: Record<string, unknown> | null } & Record<string, any>>
+  }
+
+  /**
+   * resolveForwardSnapshotForOutgoingForward
+   *
+   * Đi theo chuỗi forward_snapshot tới message gốc (tối đa 10 bước) để xác định
+   * message gốc cần snapshot khi tạo forward mới.
+   *
+   * Snapshot LƯU sourceUser đầy đủ (id/name/avatar/displayName/email/membershipStatus)
+   * — đây là "immutable history" tại thời điểm forward. Lý do:
+   *
+   * 1. Forward snapshot là bản ghi lịch sử — phản ánh trạng thái user tại thời
+   *    điểm forward, không phải hiện tại (giống Slack).
+   * 2. Forward message phải tự render được khi source message bị xoá hoặc
+   *    resolve lại qua query batch (resolveForwardedSourceUsers) gặp edge case.
+   *
+   * NOTE: Khi source author bị DEACTIVATED SAU khi forward:
+   * - Snapshot cũ (post-revert) lưu tên thật → hiển thị tên thật (immutable)
+   * - Đây là trade-off giữa "history immutable" và "mask theo state hiện tại"
+   * - resolveForwardedSourceUsers check `'membershipStatus' in sourceUser`
+   *   để quyết định query lại (snapshot cũ thiếu field → query lại với mask)
+   *
+   * Backward-compat: snapshot CŨ đã tồn tại trong DB có đủ sourceUser vẫn hoạt
+   * động (resolveForwardedSourceUsers nhận diện "có membershipStatus → đã
+   * resolve, không cần query lại").
    */
   private async resolveForwardSnapshotForOutgoingForward(
     src: Record<string, any>,
-    userId: string,
+    _userId: string,
   ): Promise<Record<string, unknown>> {
     let current: Record<string, any> = src
     for (let i = 0; i < 10; i++) {
       const snap = this.parseNestedForwardSnapshot(current.forwardSnapshot)
       if (!snap) {
+        // Đây là message gốc (không có nested snapshot) → trả về snapshot
+        // immutable tại thời điểm forward, bao gồm cả sourceUser info.
         return {
-          sourceMessageId: current.id,
-          sourceUser: current.user,
-          sourceContent: current.content,
+          sourceMessageId: current.id as string,
+          sourceUser: {
+            id: current.userId,
+            name: current.userName,
+            avatar: current.userAvatar,
+            displayName: current.userDisplayName,
+            email: current.userEmail,
+            membershipStatus: current.userMembershipStatus ?? 'active',
+          },
+          sourceContent: current.content as string,
           sourceEditedAt: current.editedAt ?? null,
         }
       }
       current = (await this.getMessageById(
         snap.sourceMessageId,
-        userId,
+        _userId,
       )) as Record<string, any>
     }
+    // Hết 10 bước vẫn chưa tới gốc → fallback trả sourceMessageId của
+    // message hiện tại (an toàn).
     return {
-      sourceMessageId: current.id,
-      sourceUser: current.user,
-      sourceContent: current.content,
+      sourceMessageId: current.id as string,
+      sourceUser: {
+        id: current.userId,
+        name: current.userName,
+        avatar: current.userAvatar,
+        displayName: current.userDisplayName,
+        email: current.userEmail,
+        membershipStatus: current.userMembershipStatus ?? 'active',
+      },
+      sourceContent: current.content as string,
       sourceEditedAt: current.editedAt ?? null,
     }
   }
@@ -373,7 +613,12 @@ export class MessageService {
   /** Xóa cache Redis trang 1 tin (channel hoặc DM) — dùng sau merge / bulk update. */
   private async buildAttachmentInsertValue(
     attachment: {
-      url: string
+      /**
+       * URL thật của file đã upload (S3/Cloudinary).
+       * OPTIONAL khi `pendingUpload=true` — lúc đó server lưu tạm với url rỗng,
+       * client sẽ PATCH qua endpoint finalize sau khi upload xong.
+       */
+      url?: string | null
       type: string
       name: string
       size: number
@@ -382,6 +627,8 @@ export class MessageService {
       height?: number | null
       duration?: number | null
       fileCategory?: string | null
+      /** Client-generated uploadId, dùng để match attachment row khi finalize. */
+      pendingUploadId?: string | null
     },
     context: {
       messageId: string
@@ -398,18 +645,20 @@ export class MessageService {
       attachment.fileCategory,
     )
     const attachmentId = randomUUID()
+    const attachmentUrl = attachment.url?.trim() ? attachment.url : ''
     let previewImageUrl: string | null = null
     let previewStatus: 'ready' | 'failed' | null = null
     let previewUpdatedAt: Date | null = null
     let previewErrorCode: string | null = null
 
-    if (supportsOfficeThumbnail(fileCategory)) {
+    // Chỉ generate thumbnail khi đã có URL thật (skip khi pendingUpload).
+    if (attachmentUrl && supportsOfficeThumbnail(fileCategory)) {
       try {
         const preview = await this.officeThumbnailGenerator.generateThumbnail({
           id: attachmentId,
           workspaceId: context.workspaceId,
           name: attachment.name,
-          url: attachment.url,
+          url: attachmentUrl,
         })
         previewImageUrl = preview.previewImageUrl
         previewStatus = 'ready'
@@ -438,8 +687,16 @@ export class MessageService {
       userId: context.userId,
       channelId: context.channelId,
       conversationId: context.conversationId,
-      ...attachment,
+      url: attachmentUrl,
+      type: attachment.type,
+      name: attachment.name,
+      size: attachment.size,
+      mimeType: attachment.mimeType,
+      width: attachment.width,
+      height: attachment.height,
+      duration: attachment.duration,
       fileCategory,
+      pendingUploadId: attachment.pendingUploadId?.trim() || null,
       previewImageUrl,
       previewStatus,
       previewUpdatedAt,
@@ -485,9 +742,9 @@ export class MessageService {
       allowEdit: messages.allowEdit,
       userId: users.id,
       userEmail: users.email,
-      userName: removedAuthorNameExpr,
-      userAvatar: removedAuthorAvatarExpr,
-      userDisplayName: removedAuthorDisplayNameExpr,
+      userName: maskedAuthorNameExpr,
+      userAvatar: maskedAuthorAvatarExpr,
+      userDisplayName: maskedAuthorDisplayNameExpr,
       userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
       userStatus: workspaceMembers.statusText,
       userStatusEmoji: workspaceMembers.statusEmoji,
@@ -495,6 +752,7 @@ export class MessageService {
       userPhone: workspaceMembers.phone,
       userDescription: workspaceMembers.description,
       userTimeZone: workspaceMembers.timeZone,
+      userMembershipStatus: maskedAuthorStatusExpr,
       parentContent: sql<string | null>`parents.content`,
       parentDeletedAt: sql<Date | null>`parents.deleted_at`,
       forwardSnapshot: messages.forwardSnapshot,
@@ -557,9 +815,9 @@ export class MessageService {
         messageId: reactions.messageId,
         emoji: reactions.emoji,
         userId: reactions.userId,
-        userName: removedAuthorNameExpr,
-        userDisplayName: removedAuthorDisplayNameExpr,
-        userAvatar: removedAuthorAvatarExpr,
+        userName: maskedAuthorNameExpr,
+        userDisplayName: maskedAuthorDisplayNameExpr,
+        userAvatar: maskedAuthorAvatarExpr,
       })
       .from(reactions)
       .innerJoin(messages, eq(reactions.messageId, messages.id))
@@ -569,20 +827,56 @@ export class MessageService {
         and(
           eq(workspaceMembers.userId, reactions.userId),
           eq(workspaceMembers.workspaceId, messages.workspaceId),
+          // (dùng messages.createdAt làm proxy vì reactions không có createdAt).
         ),
       )
       .where(inArray(reactions.messageId, messageIds))) as ReactionSnapshotRow[]
+  }
+
+  /**
+   * Resolve `viewerIsMuted` cho mỗi thread (parent message).
+   * Trả về Map<parentMessageId, isMuted> cho viewer đang xem.
+   * Messages không có parentId → không cần resolve (reply sẽ resolve theo parentId).
+   */
+  private async resolveViewerMutedByParent(
+    parentMessageIds: string[],
+    viewerId: string,
+  ): Promise<Map<string, boolean>> {
+    if (parentMessageIds.length === 0) return new Map()
+    const rows = await this.db
+      .select({
+        parentMessageId: threadSubscriptions.parentMessageId,
+        isMuted: threadSubscriptions.isMuted,
+      })
+      .from(threadSubscriptions)
+      .where(
+        and(
+          eq(threadSubscriptions.userId, viewerId),
+          inArray(threadSubscriptions.parentMessageId, parentMessageIds),
+        ),
+      )
+    const map = new Map<string, boolean>()
+    for (const r of rows) map.set(r.parentMessageId, r.isMuted)
+    return map
   }
 
   private async formatMessageRow(
     row: MessageJoinRow,
     reactionsByMessage: Record<string, ReactionSnapshot[]>,
     attachmentsMap: Map<string, any[]>,
+    viewerMutedMap?: Map<string, boolean>,
   ) {
     const atts = attachmentsMap.get(row.id) ?? []
     const enrichedAtts = await Promise.all(
-      atts.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+      atts.map(async (a) => ({
+        ...(await this.enrichAttachmentWithSignedUrl(a)),
+        pendingUpload: Boolean(a.pendingUploadId),
+      })),
     )
+
+    // viewerIsMuted: chỉ resolve ở parent message (replies resolve theo parentId).
+    const threadId = row.parentId ?? row.id
+    const viewerIsMuted = viewerMutedMap?.get(threadId) ?? false
 
     return {
       id: row.id,
@@ -606,6 +900,7 @@ export class MessageService {
       updatedAt: row.updatedAt.toISOString(),
       isPinned: row.isPinned,
       allowEdit: row.allowEdit,
+      viewerIsMuted,
       channelName: row.channelName ?? null,
       user: {
         id: row.userId,
@@ -621,6 +916,8 @@ export class MessageService {
         phone: row.userPhone,
         description: row.userDescription,
         timeZone: row.userTimeZone,
+        // null khi row JOIN không có (vd. searchWorkspaceMessages) → fallback 'active'
+        membershipStatus: row.userMembershipStatus ?? 'active',
       },
       reactions: reactionsByMessage[row.id] ?? [],
       attachments: enrichedAtts,
@@ -630,9 +927,10 @@ export class MessageService {
               content: row.parentDeletedAt ? '' : (row.parentContent ?? ''),
               deletedAt: row.parentDeletedAt?.toISOString() ?? null,
               attachments: await Promise.all(
-                (attachmentsMap.get(row.parentId) ?? []).map((a) =>
-                  this.enrichAttachmentWithSignedUrl(a),
-                ),
+                (attachmentsMap.get(row.parentId) ?? []).map(async (a) => ({
+                  ...(await this.enrichAttachmentWithSignedUrl(a)),
+                  pendingUpload: Boolean(a.pendingUploadId),
+                })),
               ),
             }
           : undefined,
@@ -669,6 +967,7 @@ export class MessageService {
             directMessageConversations.workspaceId,
           ),
           eq(workspaceMembers.userId, userId),
+          // Soft delete: chỉ count rows CHƯA bị xoá
         ),
       )
       .where(eq(directMessageConversations.id, conversationId))
@@ -732,6 +1031,7 @@ export class MessageService {
         and(
           eq(channelMembers.channelId, channels.id),
           eq(channelMembers.userId, userId),
+          // Soft delete: chỉ count rows CHƯA rời channel
         ),
       )
       .where(eq(channels.id, channelId))
@@ -815,6 +1115,13 @@ export class MessageService {
     } else {
       const conv = await this.assertConversationAccess(conversationId!, userId)
       workspaceId = conv.workspaceId
+    }
+
+    // LAZY CLEANUP: dọn các pending-upload messages quá cũ (> 30 phút).
+    // Best-effort, fire-and-forget: chạy trước khi query để cache/response không bị nhiễm.
+    // Không chờ (không await) để không block request.
+    if (!cursor) {
+      void this.cleanupStalePendingAttachments().catch(() => {})
     }
 
     // Cache hit: chỉ check cache cho page 1 (không có cursor)
@@ -906,10 +1213,19 @@ export class MessageService {
     const { reactionsByMessage, attachmentsMap } =
       await this.fetchMetadataForMessages(messageIds, parentIds)
 
-    const formattedMessages = await Promise.all(
-      messageRows.map((row) =>
-        this.formatMessageRow(row, reactionsByMessage, attachmentsMap),
+    const viewerMutedMap = await this.resolveViewerMutedByParent(
+      // Mỗi message resolve theo parentId (cho reply) hoặc theo id (cho parent).
+      Array.from(
+        new Set(messageRows.map((r) => r.parentId ?? r.id)),
       ),
+      userId,
+    )
+
+    const formattedMessages = await this.formatMessagesAndResolveForwardSources(
+      messageRows,
+      reactionsByMessage,
+      attachmentsMap,
+      viewerMutedMap,
     )
 
     const result = this.buildMessagesResponse(
@@ -1035,10 +1351,17 @@ export class MessageService {
     const { reactionsByMessage, attachmentsMap } =
       await this.fetchMetadataForMessages(messageIds)
 
-    const formattedMessages = await Promise.all(
-      messageRows.map((row) =>
-        this.formatMessageRow(row, reactionsByMessage, attachmentsMap),
-      ),
+    // Tất cả replies thuộc cùng 1 thread → resolve 1 lần cho parentId.
+    const viewerMutedMap = await this.resolveViewerMutedByParent(
+      [parentId],
+      userId,
+    )
+
+    const formattedMessages = await this.formatMessagesAndResolveForwardSources(
+      messageRows,
+      reactionsByMessage,
+      attachmentsMap,
+      viewerMutedMap,
     )
 
     const lastMsg = messageRows[messageRows.length - 1]
@@ -1246,7 +1569,7 @@ export class MessageService {
                 ? (options.forwardSnapshot ?? null)
                 : null,
           })
-          .returning()) as MessageJoinRow[]
+          .returning()) as unknown as MessageJoinRow[]
 
         let insertedAttachments: any[] = []
         if (dto.attachments && dto.attachments.length > 0) {
@@ -1278,25 +1601,54 @@ export class MessageService {
     // Invalidate page 1 cache vì có message mới → cache cũ sẽ thiếu message này
     await this.redis.del(this.messageCacheKey(targetId))
 
-    // Enqueue notification job (Background)
-    this.logger.log(`Enqueuing notification job for message ${message.id}`)
-    await this.notificationService.enqueueNotificationJob({
-      messageId: message.id,
-      senderId: userId,
-      workspaceId,
-      channelId: actualChannelId,
-      conversationId: actualConversationId,
-      content: dto.content,
-      parentId: dto.parentId ?? null,
-    })
+    // Detect nếu có attachment đang pending upload (chưa có URL thật).
+    // Nếu có → skip notification ngay, sẽ enqueue lại trong finalizeAttachment khi file cuối cùng xong.
+    const hasPendingAttachments =
+      dto.attachments?.some((a) => a.pendingUpload === true) ?? false
+
+    if (hasPendingAttachments) {
+      // Defer notification — sẽ enqueue trong finalizeAttachment khi tất cả file finalize xong.
+      this.logger.log(
+        `Deferring notification for message ${message.id} — ${dto.attachments!.length} pending attachment(s)`,
+      )
+    } else {
+      // Enqueue notification job (Background) — text-only message hoặc file đã có URL thật.
+      this.logger.log(`Enqueuing notification job for message ${message.id}`)
+      await this.notificationService.enqueueNotificationJob({
+        messageId: message.id,
+        senderId: userId,
+        workspaceId,
+        channelId: actualChannelId,
+        conversationId: actualConversationId,
+        content: dto.content,
+        parentId: dto.parentId ?? null,
+      })
+    }
 
     // Nếu là DM, cập nhật thông tin tin nhắn cuối cho conversation
-    if (actualConversationId) {
+    // Skip thread replies - chỉ update last message cho tin ở main DM
+    if (actualConversationId && !dto.parentId) {
+      let lastMessageContent = dto.content
+
+      // Nếu content là empty/null, lấy tên file đầu tiên từ attachments
+      if (!lastMessageContent || lastMessageContent.trim() === '') {
+        const [firstAttachment] = await this.db
+          .select({ name: attachments.name })
+          .from(attachments)
+          .where(eq(attachments.messageId, message.id))
+          .orderBy(asc(attachments.createdAt))
+          .limit(1)
+
+        if (firstAttachment?.name) {
+          lastMessageContent = firstAttachment.name
+        }
+      }
+
       await this.db
         .update(directMessageConversations)
         .set({
           lastMessageAt: new Date(),
-          lastMessageContent: dto.content,
+          lastMessageContent,
           lastMessageUserId: userId,
           lastMessageId: message.id,
         })
@@ -1374,20 +1726,26 @@ export class MessageService {
         new Set([...recipientIds, ...subscribers.map((s) => s.userId)]),
       )
 
-      await this.notificationService.createReplyNotifications({
-        actorId: userId,
-        workspaceId,
-        messageId: message.id,
-        parentMessageId: dto.parentId,
-        channelId: actualChannelId ?? null,
-        conversationId: actualConversationId ?? null,
-      })
+      // Skip reply notification nếu có pending attachment — sẽ gửi khi finalize xong.
+      if (!hasPendingAttachments) {
+        await this.notificationService.createReplyNotifications({
+          actorId: userId,
+          workspaceId,
+          messageId: message.id,
+          parentMessageId: dto.parentId,
+          channelId: actualChannelId ?? null,
+          conversationId: actualConversationId ?? null,
+        })
+      }
     }
 
     const user = await this.getAuthorProfileForWorkspace(userId, workspaceId)
 
     const enrichedAttachments = await Promise.all(
-      createdAttachments.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+      createdAttachments.map(async (a) => ({
+        ...(await this.enrichAttachmentWithSignedUrl(a)),
+        pendingUpload: Boolean(a.pendingUploadId),
+      })),
     )
 
     // Lấy attachments của tin nhắn cha nếu cần thiết cho alsoSendToChannel
@@ -1397,7 +1755,10 @@ export class MessageService {
         .getAttachmentsByMessageIds([dto.parentId])
         .then((map) => map.get(dto.parentId!) ?? [])
       parentAttachments = await Promise.all(
-        parentAttachments.map((a) => this.enrichAttachmentWithSignedUrl(a)),
+        parentAttachments.map(async (a) => ({
+          ...(await this.enrichAttachmentWithSignedUrl(a)),
+          pendingUpload: Boolean(a.pendingUploadId),
+        })),
       )
     }
 
@@ -1552,6 +1913,7 @@ export class MessageService {
 
   private buildTimelineTextContent(
     kind:
+      | 'channel_name'
       | 'channel_topic'
       | 'channel_description'
       | 'channel_posting_permissions'
@@ -1562,29 +1924,12 @@ export class MessageService {
       | 'dm_merged_out',
     value?: string | null,
   ): string {
-    if (kind === 'dm_merged_out') {
-      return 'Messages from this conversation were moved into your combined conversation.'
-    }
-    if (kind === 'dm_merge') {
-      return 'Moved messages from a previous conversation into this one.'
-    }
-    if (kind === 'channel_posting_permissions') {
-      return 'changed the channel posting permissions'
-    }
-    if (kind === 'channel_privacy') {
-      return value === 'private'
-        ? 'changed the channel to private'
-        : 'changed the channel to public'
-    }
-    const scope = kind.startsWith('dm_') ? 'conversation' : 'channel'
-    const isTopic = kind.endsWith('_topic')
-    const v = value?.trim() ? value.trim() : null
-    if (isTopic) {
-      return v ? `set the ${scope} topic: ${v}` : `removed the ${scope} topic`
-    }
-    return v
-      ? `set the ${scope} description: ${v}`
-      : `removed the ${scope} description`
+    // Marker có cấu trúc cho phép frontend parse + i18n sang vi/en.
+    // Format: `__TIMELINE__:<kind>:<value-or-empty>`
+    // Frontend sẽ tìm marker này trong message.content và thay bằng
+    // bản dịch tương ứng; nếu không có marker (legacy data) → fallback
+    // raw content để không vỡ history.
+    return `__TIMELINE__:${kind}:${value ?? ''}`
   }
 
   /**
@@ -1594,6 +1939,7 @@ export class MessageService {
     params: { channelId?: string; conversationId?: string },
     actorUserId: string,
     kind:
+      | 'channel_name'
       | 'channel_topic'
       | 'channel_description'
       | 'channel_posting_permissions'
@@ -1639,7 +1985,7 @@ export class MessageService {
         alsoSendToChannel: false,
         allowEdit: false,
       })
-      .returning()) as MessageJoinRow[]
+      .returning()) as unknown as MessageJoinRow[]
 
     await this.redis.del(this.messageCacheKey(targetId))
 
@@ -1790,12 +2136,16 @@ export class MessageService {
       await this.assertConversationAccess(row.conversationId, userId)
     }
 
-    const [recipientIds, { reactionsByMessage, attachmentsMap }] =
+    const [recipientIds, { reactionsByMessage, attachmentsMap }, viewerMutedMap] =
       await Promise.all([
         this.getRecipientIds(messageId, row.parentId),
         this.fetchMetadataForMessages(
           [messageId],
           row.parentId ? [row.parentId] : [],
+        ),
+        this.resolveViewerMutedByParent(
+          [row.parentId ?? messageId],
+          userId,
         ),
       ])
 
@@ -1803,8 +2153,333 @@ export class MessageService {
       row,
       reactionsByMessage,
       attachmentsMap,
+      viewerMutedMap,
     )
     return { ...formatted, recipientIds }
+  }
+
+  /**
+   * Finalize attachment: client upload xong file lên S3/Cloudinary,
+   * gọi API này để update URL thật cho attachment row đang pending.
+   *
+   * Match attachment theo (messageId, pendingUploadId) — pendingUploadId là client-generated
+   * uploadId, giúp client track progress/retry/finalize mà không cần biết server-generated id.
+   *
+   * Authorization: chỉ owner message được finalize.
+   */
+  async finalizeAttachment(
+    messageId: string,
+    pendingUploadId: string,
+    userId: string,
+    dto: FinalizeAttachmentDto,
+  ) {
+    if (!pendingUploadId || typeof pendingUploadId !== 'string') {
+      throw new BadRequestException('pendingUploadId không hợp lệ')
+    }
+
+    const [message] = await this.db
+      .select({
+        id: messages.id,
+        userId: messages.userId,
+        deletedAt: messages.deletedAt,
+      })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1)
+
+    if (!message || message.deletedAt) {
+      throw new NotFoundException('Message không tồn tại')
+    }
+    if (message.userId !== userId) {
+      throw new ForbiddenException(
+        'Bạn không có quyền finalize attachment của message này',
+      )
+    }
+
+    const [attachment] = await this.db
+      .select({
+        id: attachments.id,
+        fileCategory: attachments.fileCategory,
+      })
+      .from(attachments)
+      .where(
+        and(
+          eq(attachments.messageId, messageId),
+          eq(attachments.pendingUploadId, pendingUploadId),
+        ),
+      )
+      .limit(1)
+
+    if (!attachment) {
+      throw new NotFoundException(
+        'Attachment không tồn tại hoặc đã được finalize',
+      )
+    }
+
+    // Lấy workspaceId từ message để dùng cho thumbnail generation
+    const [messageWithWorkspace] = await this.db
+      .select({ workspaceId: messages.workspaceId })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1)
+
+    const [updated] = await this.db
+      .update(attachments)
+      .set({
+        url: dto.url,
+        mimeType: dto.mimeType ?? null,
+        width: dto.width ?? null,
+        height: dto.height ?? null,
+        duration: dto.duration ?? null,
+        fileCategory: dto.fileCategory ?? attachment.fileCategory,
+        pendingUploadId: null, // Clear sau khi finalize
+        updatedAt: new Date(),
+      })
+      .where(eq(attachments.id, attachment.id))
+      .returning()
+
+    // Generate thumbnail cho Office files và lưu vào DB
+    let previewImageUrl: string | null = null
+    let previewStatus: 'ready' | 'failed' | null = null
+    let previewErrorCode: string | null = null
+
+    if (
+      messageWithWorkspace?.workspaceId &&
+      supportsOfficeThumbnail(updated.fileCategory)
+    ) {
+      try {
+        const preview = await this.officeThumbnailGenerator.generateThumbnail({
+          id: updated.id,
+          workspaceId: messageWithWorkspace.workspaceId,
+          name: updated.name,
+          url: dto.url,
+        })
+        previewImageUrl = preview.previewImageUrl
+        previewStatus = 'ready'
+
+        // Update DB với preview data
+        await this.db
+          .update(attachments)
+          .set({
+            previewImageUrl,
+            previewStatus,
+            previewUpdatedAt: new Date(),
+          })
+          .where(eq(attachments.id, updated.id))
+      } catch (error) {
+        const previewError =
+          error instanceof OfficeThumbnailError
+            ? error
+            : new OfficeThumbnailError(
+                'unknown_preview_error',
+                'Unknown Office preview generation error.',
+              )
+        this.logger.warn(
+          `Office preview async failed for ${updated.name}: ${previewError.code}`,
+        )
+        previewStatus = 'failed'
+        previewErrorCode = previewError.code
+
+        // Update DB với error status
+        await this.db
+          .update(attachments)
+          .set({
+            previewStatus,
+            previewErrorCode,
+            previewUpdatedAt: new Date(),
+          })
+          .where(eq(attachments.id, updated.id))
+      }
+    }
+
+    // Invalidate message cache (nếu có) để lần GET tiếp theo trả về attachment mới.
+    await this.invalidateMessagePage1CachesForMessage(updated.messageId)
+
+    // Lấy message đầy đủ để check còn attachment nào đang pendingUpload không.
+    // Nếu tất cả file đã finalize xong → broadcast CREATE message đầy đủ cho User B.
+    const fullMessage = await this.getMessageById(
+      updated.messageId,
+      userId,
+    )
+    const stillPending = Array.isArray(fullMessage?.attachments)
+      && fullMessage.attachments.some(
+        // FIX: check pendingUpload (computed boolean from pendingUploadId)
+        (a: any) => a?.pendingUpload === true,
+      )
+
+    // DEBUG: Log URL in fullMessage.attachments
+    this.logger.debug(
+      `finalizeAttachment result - messageId: ${updated.messageId}, ` +
+      `attachments count: ${fullMessage?.attachments?.length ?? 'N/A'}, ` +
+      `URL length: ${fullMessage?.attachments?.[0]?.url?.length ?? 'N/A'}, ` +
+      `URL: ${fullMessage?.attachments?.[0]?.url ?? 'N/A'}, ` +
+      `stillPending: ${stillPending}`,
+    )
+
+    // Query lại attachment từ DB để lấy preview data mới nhất
+    const [finalAttachment] = await this.db
+      .select()
+      .from(attachments)
+      .where(eq(attachments.id, updated.id))
+      .limit(1)
+
+    return {
+      attachment: this.enrichAttachmentWithSignedUrl(finalAttachment ?? updated),
+      fullMessage,
+      stillPending,
+    }
+  }
+
+  /**
+   * Enqueue deferred notification sau khi finalizeAttachment hoàn tất.
+   * Gọi từ controller sau khi service trả về result.
+   * Tách riêng để tránh circular dependency với NotificationModule.
+   */
+  async enqueueDeferredNotification(messageId: string, userId: string): Promise<void> {
+    try {
+      const message = await this.getMessageById(messageId, userId)
+      if (!message) {
+        this.logger.warn(`enqueueDeferredNotification: message ${messageId} not found`)
+        return
+      }
+
+      const ctx = await this.getMessageBroadcastContext(messageId)
+      if (!ctx) {
+        this.logger.warn(`enqueueDeferredNotification: no broadcast context for ${messageId}`)
+        return
+      }
+
+      await this.notificationService.enqueueNotificationJob({
+        messageId,
+        senderId: userId,
+        workspaceId: ctx.workspaceId,
+        channelId: message.channelId ?? undefined,
+        conversationId: message.conversationId ?? undefined,
+        content: message.content ?? '',
+        parentId: message.parentId ?? null,
+      })
+      this.logger.log(
+        `Enqueued deferred notification for finalized message ${messageId}`,
+      )
+    } catch (err) {
+      this.logger.warn(
+        `Failed to enqueue deferred notification for ${messageId}: ${(err as Error).message}`,
+      )
+    }
+  }
+
+  /**
+   * getParentThreadMetadata — lấy reply metadata của parent message để inject vào
+   * broadcast CREATE khi finalizeAttachment hoàn tất.
+   * Trả về { replyCount, replyParticipantIds, lastReplyAt, content, deletedAt } hoặc null.
+   */
+  async getParentThreadMetadata(
+    parentMessageId: string,
+  ): Promise<{
+    replyCount: number
+    replyParticipantIds: string[]
+    lastReplyAt: string | null
+    content: string | null
+    deletedAt: string | null
+  } | null> {
+    const [row] = await this.db
+      .select({
+        replyCount: messages.replyCount,
+        lastReplyAt: messages.lastReplyAt,
+        content: messages.content,
+        deletedAt: messages.deletedAt,
+      })
+      .from(messages)
+      .where(eq(messages.id, parentMessageId))
+      .limit(1)
+
+    if (!row) return null
+
+    // Lấy danh sách distinct userIds của các replies (giới hạn 5, giống createMessage)
+    const participants = await this.db
+      .select({ userId: messages.userId })
+      .from(messages)
+      .where(eq(messages.parentId, parentMessageId))
+      .groupBy(messages.userId)
+      .limit(5)
+
+    const replyParticipantIds = participants.map((p) => p.userId)
+
+    return {
+      replyCount: row.replyCount ?? 0,
+      replyParticipantIds,
+      lastReplyAt:
+        row.lastReplyAt instanceof Date
+          ? row.lastReplyAt.toISOString()
+          : (row.lastReplyAt as string | null),
+      content:
+        row.deletedAt !== null
+          ? ''
+          : (row.content as string | null),
+      deletedAt:
+        row.deletedAt instanceof Date
+          ? row.deletedAt.toISOString()
+          : (row.deletedAt as string | null),
+    }
+  }
+
+  /**
+   * Helper: invalidate cache cho message cụ thể.
+   * Best-effort, swallow errors.
+   */
+  private async invalidateMessagePage1CachesForMessage(messageId: string) {
+    try {
+      const [msg] = await this.db
+        .select({
+          channelId: messages.channelId,
+          conversationId: messages.conversationId,
+        })
+        .from(messages)
+        .where(eq(messages.id, messageId))
+        .limit(1)
+      const targetIds: string[] = []
+      if (msg?.channelId) targetIds.push(msg.channelId)
+      if (msg?.conversationId) targetIds.push(msg.conversationId)
+      if (targetIds.length > 0) {
+        await this.invalidateMessagePage1Caches(targetIds)
+      }
+    } catch (err) {
+      this.logger.warn(
+        `invalidateMessagePage1CachesForMessage failed for ${messageId}: ${(err as Error).message}`,
+      )
+    }
+  }
+
+  /**
+   * Helper: trả về room key + workspaceId cho message để broadcast event.
+   * Channel messages → `channel:<id>`, DM → `conversation:<id>`, null nếu không tìm thấy.
+   */
+  async getMessageBroadcastContext(
+    messageId: string,
+  ): Promise<{ room: string; workspaceId: string } | null> {
+    const [msg] = await this.db
+      .select({
+        channelId: messages.channelId,
+        conversationId: messages.conversationId,
+        workspaceId: sql<string>`COALESCE(${channels.workspaceId}, ${directMessageConversations.workspaceId})`,
+      })
+      .from(messages)
+      .leftJoin(channels, eq(messages.channelId, channels.id))
+      .leftJoin(
+        directMessageConversations,
+        eq(messages.conversationId, directMessageConversations.id),
+      )
+      .where(eq(messages.id, messageId))
+      .limit(1)
+
+    if (!msg) return null
+    const room = msg.channelId
+      ? `channel:${msg.channelId}`
+      : msg.conversationId
+        ? `conversation:${msg.conversationId}`
+        : null
+    if (!room || !msg.workspaceId) return null
+    return { room, workspaceId: msg.workspaceId }
   }
 
   async getMessagesByIds(messageIds: string[], userId: string) {
@@ -1859,17 +2534,24 @@ export class MessageService {
 
     // 3. Fetch metadata in bulk
     const parentIds = rows.map((r) => r.parentId).filter(Boolean) as string[]
-    const { reactionsByMessage, attachmentsMap } =
-      await this.fetchMetadataForMessages(
-        rows.map((r) => r.id),
-        parentIds,
-      )
+    const [{ reactionsByMessage, attachmentsMap }, viewerMutedMap] =
+      await Promise.all([
+        this.fetchMetadataForMessages(
+          rows.map((r) => r.id),
+          parentIds,
+        ),
+        this.resolveViewerMutedByParent(
+          Array.from(new Set(rows.map((r) => r.parentId ?? r.id))),
+          userId,
+        ),
+      ])
 
     // 4. Format all rows
-    const formattedMessages = await Promise.all(
-      rows.map((row) =>
-        this.formatMessageRow(row, reactionsByMessage, attachmentsMap),
-      ),
+    const formattedMessages = await this.formatMessagesAndResolveForwardSources(
+      rows,
+      reactionsByMessage,
+      attachmentsMap,
+      viewerMutedMap,
     )
 
     return new Map(formattedMessages.map((m) => [m.id, m]))
@@ -1923,6 +2605,7 @@ export class MessageService {
         and(
           eq(workspaceMembers.userId, users.id),
           eq(workspaceMembers.workspaceId, workspaceId),
+          // Soft delete: chỉ match rows CHƯA bị xoá
         ),
       )
       .where(eq(users.id, userId))
@@ -1932,7 +2615,7 @@ export class MessageService {
 
     const isRemovedWorkspaceMember = row.wmId == null
     const name = isRemovedWorkspaceMember
-      ? 'deactivated user'
+      ? 'Deleted user'
       : (row.wmName ?? row.accountName ?? null)
     const avatar = isRemovedWorkspaceMember
       ? null
@@ -1943,7 +2626,7 @@ export class MessageService {
       avatar,
       email: isRemovedWorkspaceMember ? '' : row.email,
       displayName: isRemovedWorkspaceMember
-        ? 'deactivated user'
+        ? 'Deleted user'
         : (row.displayName ?? name),
       isAway: row.isAway ?? false,
       namePronunciation: row.namePronunciation ?? null,
@@ -2179,6 +2862,197 @@ export class MessageService {
     return { messageId, room, deleted: true, parentId: message.parentId }
   }
 
+  /**
+   * abortMessage — HARD delete cho message có attachments đang pending upload.
+   *
+   * Chỉ cho phép khi:
+   * 1. Message tồn tại + chưa bị xóa (deletedAt = null)
+   * 2. Tất cả attachments còn pendingUploadId (chưa file nào finalize xong)
+   * 3. Owner là user gọi
+   *
+   * → DELETE message row + CASCADE attachments
+   * → Trả về room + parentId để controller broadcast message_deleted.
+   *
+   * Use case: user A upload file rồi navigate away/refresh — composer unmount
+   * → cleanup API được gọi để xóa orphan message khỏi DB, tránh User B thấy spinner mãi.
+   */
+  async abortMessage(messageId: string, userId: string) {
+    const [message] = (await this.db
+      .select({
+        id: messages.id,
+        userId: messages.userId,
+        workspaceId: messages.workspaceId,
+        channelId: messages.channelId,
+        conversationId: messages.conversationId,
+        parentId: messages.parentId,
+        type: messages.type,
+      })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1)) as Array<{
+      id: string
+      userId: string
+      workspaceId: string | null
+      channelId: string | null
+      conversationId: string | null
+      parentId: string | null
+      type: string
+    }>
+
+    if (!message) throw new NotFoundException('Message not found')
+    if (message.userId !== userId)
+      throw new ForbiddenException('Not your message')
+
+    // Check message chưa bị soft-delete
+    const [messageFresh] = await this.db
+      .select({ deletedAt: messages.deletedAt })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1)
+    if (messageFresh?.deletedAt) {
+      throw new ForbiddenException('Message already deleted')
+    }
+
+    // Check tất cả attachments của message này còn pendingUploadId
+    // → nếu đã có 1 file finalize xong (url đã có) thì KHÔNG cho abort,
+    //   user phải xóa cả message bằng deleteMessage thông thường.
+    const allAttachments = await this.db
+      .select({
+        id: attachments.id,
+        pendingUploadId: attachments.pendingUploadId,
+        url: attachments.url,
+      })
+      .from(attachments)
+      .where(eq(attachments.messageId, messageId))
+
+    const hasFinalizedAttachment = allAttachments.some(
+      (a) => !a.pendingUploadId || (a.url && a.url.length > 0),
+    )
+    if (hasFinalizedAttachment) {
+      throw new ForbiddenException(
+        'Message has finalized attachments — cannot abort',
+      )
+    }
+
+    const targetId = (message.channelId || message.conversationId) as string
+    const room = message.channelId
+      ? `channel:${message.channelId}`
+      : `conversation:${message.conversationId}`
+
+    // Hard delete message — attachments CASCADE theo schema FK
+    await this.db.delete(messages).where(eq(messages.id, messageId))
+
+    // Invalidate cache
+    await this.redis.del(this.messageCacheKey(targetId))
+
+    this.logger.log(
+      `Aborted pending-upload message ${messageId} (owner=${userId}, attachments=${allAttachments.length})`,
+    )
+
+    return { messageId, room, aborted: true, parentId: message.parentId }
+  }
+
+  /**
+   * cleanupStalePendingAttachments — TTL cleanup cho attachment pending quá lâu.
+   *
+   * Use case: user A đã gọi sendMessage với attachments đang pending, nhưng bị mất kết nối /
+   * refresh / kill tab trước khi finalize (hoặc trước khi abort API được gọi).
+   * → Attachment row treo vĩnh viễn → User B refresh sẽ thấy spinner vô tận.
+   *
+   * Giải pháp: method này tìm các attachments có `pendingUploadId IS NOT NULL`
+   * + `url = ''` + `createdAt < cutoff` (mặc định 30 phút).
+   * Với MỖI attachment tìm được:
+   * - Nếu message có file khác đã finalize → KHÔNG abort (chỉ xoá file pending, giữ message)
+   *   (nhưng thực tế trong hệ thống hiện tại, mỗi message abort phải all-or-nothing,
+   *    nên ta sẽ abort toàn message nếu TẤT CẢ file pending)
+   * - Nếu TẤT CẢ attachment của message vẫn pending → HARD delete message
+   *
+   * Trả về danh sách messageIds đã bị xoá để caller broadcast nếu cần.
+   * Best-effort: swallow errors, log warning.
+   */
+  async cleanupStalePendingAttachments(
+    staleAfterMinutes = 30,
+  ): Promise<string[]> {
+    try {
+      const cutoff = new Date(Date.now() - staleAfterMinutes * 60 * 1000)
+
+      // Tìm attachments pending quá cũ
+      const staleAttachments = await this.db
+        .select({
+          messageId: attachments.messageId,
+          attachmentId: attachments.id,
+          pendingUploadId: attachments.pendingUploadId,
+        })
+        .from(attachments)
+        .where(
+          and(
+            isNotNull(attachments.pendingUploadId),
+            or(eq(attachments.url, ''), isNull(attachments.url)),
+            lt(attachments.createdAt, cutoff),
+          ),
+        )
+
+      if (staleAttachments.length === 0) return []
+
+      // Group theo messageId
+      const messageIds = Array.from(
+        new Set(staleAttachments.map((a) => a.messageId)),
+      )
+
+      // Với mỗi message, check xem còn attachment nào đã finalize không
+      const messagesToAbort: string[] = []
+      for (const messageId of messageIds) {
+        const allAtts = await this.db
+          .select({
+            id: attachments.id,
+            pendingUploadId: attachments.pendingUploadId,
+            url: attachments.url,
+          })
+          .from(attachments)
+          .where(eq(attachments.messageId, messageId))
+
+        const hasFinalizedAttachment = allAtts.some(
+          (a) => !a.pendingUploadId || (a.url && a.url.length > 0),
+        )
+        if (!hasFinalizedAttachment) {
+          messagesToAbort.push(messageId)
+        }
+      }
+
+      // Hard delete các orphan messages
+      for (const messageId of messagesToAbort) {
+        await this.db.delete(messages).where(eq(messages.id, messageId))
+        this.logger.log(
+          `TTL cleanup: aborted stale pending-upload message ${messageId}`,
+        )
+      }
+
+      // Invalidate cache cho các message bị xoá
+      if (messagesToAbort.length > 0) {
+        const targetIds = await this.db
+          .select({
+            channelId: messages.channelId,
+            conversationId: messages.conversationId,
+          })
+          .from(messages)
+          .where(inArray(messages.id, messagesToAbort))
+        const targetIdSet = new Set<string>()
+        for (const t of targetIds) {
+          if (t.channelId) targetIdSet.add(t.channelId)
+          if (t.conversationId) targetIdSet.add(t.conversationId)
+        }
+        await this.invalidateMessagePage1Caches(Array.from(targetIdSet))
+      }
+
+      return messagesToAbort
+    } catch (err) {
+      this.logger.warn(
+        `cleanupStalePendingAttachments failed: ${(err as Error).message}`,
+      )
+      return []
+    }
+  }
+
   /** togglePin — ghim hoặc bỏ ghim tin nhắn */
   async togglePin(messageId: string, userId: string) {
     const [message] = (await this.db
@@ -2281,10 +3155,16 @@ export class MessageService {
     const { reactionsByMessage, attachmentsMap } =
       await this.fetchMetadataForMessages(messageIds, parentIds)
 
-    const formattedMessages = await Promise.all(
-      rows.map((row) =>
-        this.formatMessageRow(row, reactionsByMessage, attachmentsMap),
-      ),
+    const viewerMutedMap = await this.resolveViewerMutedByParent(
+      Array.from(new Set(rows.map((r) => r.parentId ?? r.id))),
+      userId,
+    )
+
+    const formattedMessages = await this.formatMessagesAndResolveForwardSources(
+      rows,
+      reactionsByMessage,
+      attachmentsMap,
+      viewerMutedMap,
     )
 
     return formattedMessages
@@ -2740,38 +3620,44 @@ export class MessageService {
     const { reactionsByMessage, attachmentsMap } =
       await this.fetchMetadataForMessages(messageIds, parentIds)
 
-    const items = await Promise.all(
-      pageRows.map(async (row) => {
-        const message = await this.formatMessageRow(
-          row,
-          reactionsByMessage,
-          attachmentsMap,
-        )
-
-        return {
-          message,
-          rank:
-            row.rank == null || Number.isNaN(Number(row.rank))
-              ? null
-              : Number(row.rank),
-          excerpt: row.excerpt || '',
-          location: row.channelId
-            ? {
-                kind: 'channel' as const,
-                channelId: row.channelId,
-                channelName: row.channelName ?? 'Channel',
-                isPrivate: Boolean(row.channelIsPrivate),
-              }
-            : {
-                kind: 'conversation' as const,
-                conversationId: row.conversationId!,
-                conversationLabel:
-                  row.conversationLabel?.trim() || 'Direct Message',
-                isGroup: Boolean(row.conversationIsGroup),
-              },
-        }
-      }),
+    const viewerMutedMap = await this.resolveViewerMutedByParent(
+      Array.from(new Set(pageRows.map((r) => r.parentId ?? r.id))),
+      userId,
     )
+
+    const formattedMessages = await this.formatMessagesAndResolveForwardSources(
+      pageRows,
+      reactionsByMessage,
+      attachmentsMap,
+      viewerMutedMap,
+    )
+
+    // Map formatted → items (giữ shape cũ với rank/excerpt/location)
+    const items = formattedMessages.map((message, idx) => {
+      const row = pageRows[idx]
+      return {
+        message,
+        rank:
+          row.rank == null || Number.isNaN(Number(row.rank))
+            ? null
+            : Number(row.rank),
+        excerpt: row.excerpt || '',
+        location: row.channelId
+          ? {
+              kind: 'channel' as const,
+              channelId: row.channelId,
+              channelName: row.channelName ?? 'Channel',
+              isPrivate: Boolean(row.channelIsPrivate),
+            }
+          : {
+              kind: 'conversation' as const,
+              conversationId: row.conversationId!,
+              conversationLabel:
+                row.conversationLabel?.trim() || 'Direct Message',
+              isGroup: Boolean(row.conversationIsGroup),
+            },
+      }
+    })
 
     const total = Number(countRow?.total ?? 0)
 
@@ -2810,6 +3696,7 @@ export class MessageService {
         const attachment = {
           ...enrichedAtt,
           createdAt: attCreated,
+          pendingUpload: false,
         }
         const message = {
           id: row.id,
@@ -2842,6 +3729,7 @@ export class MessageService {
             phone: row.userPhone,
             description: row.userDescription,
             timeZone: row.userTimeZone,
+            membershipStatus: row.userMembershipStatus ?? 'active',
           },
           reactions: [] as {
             emoji: string
@@ -2923,9 +3811,9 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: removedAuthorNameExpr,
-        userAvatar: removedAuthorAvatarExpr,
-        userDisplayName: removedAuthorDisplayNameExpr,
+        userName: maskedAuthorNameExpr,
+        userAvatar: maskedAuthorAvatarExpr,
+        userDisplayName: maskedAuthorDisplayNameExpr,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userStatus: workspaceMembers.statusText,
         userStatusEmoji: workspaceMembers.statusEmoji,
@@ -2933,6 +3821,7 @@ export class MessageService {
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,
         userTimeZone: workspaceMembers.timeZone,
+        userMembershipStatus: maskedAuthorStatusExpr,
         isPinned: messages.isPinned,
         allowEdit: messages.allowEdit,
       })
@@ -3017,6 +3906,75 @@ export class MessageService {
   }
 
   /**
+   * markThreadAsUnread — Cập nhật lastReadAt cho một thread cụ thể của user
+   * bằng createdAt của message được chỉ định.
+   */
+  async markThreadAsUnread(parentMessageId: string, messageId: string, userId: string) {
+    // Get the message's createdAt to set as lastReadAt
+    const [message] = await this.db
+      .select({ createdAt: messages.createdAt })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1)
+
+    if (!message) {
+      throw new NotFoundException('Message not found')
+    }
+
+    await this.db
+      .update(threadSubscriptions)
+      .set({ lastReadAt: message.createdAt })
+      .where(
+        and(
+          eq(threadSubscriptions.userId, userId),
+          eq(threadSubscriptions.parentMessageId, parentMessageId),
+        ),
+      )
+  }
+
+  /**
+   * toggleThreadMute — Bật/tắt thông báo cho một thread cụ thể của user.
+   * Nếu chưa có subscription thì tạo mới (ensure).
+   */
+  async toggleThreadMute(
+    userId: string,
+    parentMessageId: string,
+    workspaceId: string,
+    isMuted: boolean,
+  ) {
+    await this.ensureThreadSubscription(userId, parentMessageId, workspaceId)
+
+    const [parent] = await this.db
+      .select({
+        channelId: messages.channelId,
+        conversationId: messages.conversationId,
+      })
+      .from(messages)
+      .where(eq(messages.id, parentMessageId))
+      .limit(1)
+
+    const [updated] = await this.db
+      .update(threadSubscriptions)
+      .set({ isMuted })
+      .where(
+        and(
+          eq(threadSubscriptions.userId, userId),
+          eq(threadSubscriptions.parentMessageId, parentMessageId),
+        ),
+      )
+      .returning()
+
+    // Invalidate page-1 cache để lần fetch sau trả viewerIsMuted mới.
+    if (parent?.channelId) {
+      await this.redis.del(this.messageCacheKey(parent.channelId))
+    } else if (parent?.conversationId) {
+      await this.redis.del(this.messageCacheKey(parent.conversationId))
+    }
+
+    return updated ?? { isMuted }
+  }
+
+  /**
    * Tìm file đính kèm chung cho Channel và DM theo tên.
    */
   async searchFiles(
@@ -3075,9 +4033,9 @@ export class MessageService {
         updatedAt: messages.updatedAt,
         userId: users.id,
         userEmail: users.email,
-        userName: removedAuthorNameExpr,
-        userAvatar: removedAuthorAvatarExpr,
-        userDisplayName: removedAuthorDisplayNameExpr,
+        userName: maskedAuthorNameExpr,
+        userAvatar: maskedAuthorAvatarExpr,
+        userDisplayName: maskedAuthorDisplayNameExpr,
         userIsAway: sql<boolean>`COALESCE(${workspaceMembers.isAway}, false)`,
         userStatus: workspaceMembers.statusText,
         userStatusEmoji: workspaceMembers.statusEmoji,
@@ -3085,6 +4043,7 @@ export class MessageService {
         userPhone: workspaceMembers.phone,
         userDescription: workspaceMembers.description,
         userTimeZone: workspaceMembers.timeZone,
+        userMembershipStatus: maskedAuthorStatusExpr,
         isPinned: messages.isPinned,
         allowEdit: messages.allowEdit,
       })
@@ -3184,6 +4143,7 @@ export class MessageService {
       .select({
         ...this.getMessageSelectFields(),
         lastReadAt: threadSubscriptions.lastReadAt,
+        isMuted: threadSubscriptions.isMuted,
         channelName: channels.name,
         channelType: channels.type,
         channelIsPrivate: channels.isPrivate,
@@ -3212,6 +4172,7 @@ export class MessageService {
       .orderBy(desc(messages.lastReplyAt))
       .limit(PAGE_SIZE + 1)) as (MessageJoinRow & {
       lastReadAt: Date
+      isMuted: boolean
       channelName: string | null
       channelType: string | null
       channelIsPrivate: boolean | null
@@ -3226,6 +4187,11 @@ export class MessageService {
     const { reactionsByMessage, attachmentsMap } =
       await this.fetchMetadataForMessages(messageIds)
 
+    // Tất cả rows ở đây đều là parent messages (threadSubscriptions.parentMessageId)
+    // nên mỗi row có isMuted trực tiếp từ join — build map để formatMessageRow dùng.
+    const viewerMutedMap = new Map<string, boolean>()
+    threadRows.forEach((r) => viewerMutedMap.set(r.id, r.isMuted))
+
     // 3. Format kết quả trả về
     const threads = await Promise.all(
       threadRows.map(async (row) => {
@@ -3233,7 +4199,12 @@ export class MessageService {
           row,
           reactionsByMessage,
           attachmentsMap,
+          viewerMutedMap,
         )
+        // Resolve forward source nếu có (per-thread batch)
+        if (formatted.forwardSnapshot) {
+          await this.resolveForwardedSourceUsers([formatted])
+        }
 
         // Lấy danh sách reply để hiển thị snippet (giống Slack)
         // Lấy tối đa 5 tin nhắn con mới nhất để làm snippet ban đầu
@@ -3300,3 +4271,4 @@ export class MessageService {
     }
   }
 }
+

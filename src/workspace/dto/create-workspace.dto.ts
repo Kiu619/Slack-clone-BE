@@ -9,6 +9,7 @@ export const CreateWorkspaceSchema = z.object({
   inviteCode: z.string().uuid('Invalid invite code'),
   slug: z.string().min(1, 'Slug is required'),
   memberEmails: z.array(z.string().email()).optional().default([]),
+  timeZone: z.string().nullable().optional(),
 })
 
 export type CreateWorkspaceDto = z.infer<typeof CreateWorkspaceSchema>

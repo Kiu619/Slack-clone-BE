@@ -23,6 +23,10 @@ import {
   type UpdateMemberStatusDto,
 } from './dto/update-member-status.dto'
 import {
+  SetNotificationPausedUntilSchema,
+  type SetNotificationPausedUntilDto,
+} from './dto/set-notification-paused-until.dto'
+import {
   InviteEmailsSchema,
   type InviteEmailsDto,
 } from './dto/invite-emails.dto'
@@ -159,20 +163,6 @@ export class WorkspaceController {
     )
   }
 
-  @Delete(':workspaceId/members/:userId')
-  removeDeactivatedMember(
-    @Req() req: Request,
-    @Param('workspaceId') workspaceId: string,
-    @Param('userId') targetUserId: string,
-  ) {
-    const { id: userId } = req.user as { id: string }
-    return this.workspaceService.removeDeactivatedWorkspaceMember(
-      workspaceId,
-      userId,
-      targetUserId,
-    )
-  }
-
   @Post(':workspaceId/invite-emails')
   @HttpCode(HttpStatus.OK)
   inviteEmails(
@@ -185,8 +175,18 @@ export class WorkspaceController {
       workspaceId,
       userId,
       dto.emails,
-      dto.channelId,
+      dto.channelIds,
     )
+  }
+
+  @Get(':workspaceId/member-emails')
+  @HttpCode(HttpStatus.OK)
+  getMemberEmails(
+    @Req() req: Request,
+    @Param('workspaceId') workspaceId: string,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.workspaceService.getActiveMemberEmails(workspaceId, userId)
   }
 
   @Get(':workspaceId/members/:userId/status')
@@ -223,11 +223,31 @@ export class WorkspaceController {
     return this.workspaceService.clearMemberStatus(userId, workspaceId)
   }
 
+  @Patch(':workspaceId/notifications/pause')
+  setNotificationPausedUntil(
+    @Req() req: Request,
+    @Param('workspaceId') workspaceId: string,
+    @Body(new ZodValidationPipe(SetNotificationPausedUntilSchema))
+    dto: SetNotificationPausedUntilDto,
+  ) {
+    const { id: userId } = req.user as { id: string }
+    return this.workspaceService.setNotificationPausedUntil(
+      userId,
+      workspaceId,
+      dto.pausedUntil,
+      dto.auto,
+    )
+  }
+
   @Post('join')
   @HttpCode(HttpStatus.OK)
   @SkipWorkspaceMemberCheck()
-  join(@Req() req: Request, @Body('inviteCode') inviteCode: string) {
+  join(
+    @Req() req: Request,
+    @Body('inviteCode') inviteCode: string,
+    @Body('timeZone') timeZone?: string,
+  ) {
     const { id: userId } = req.user as { id: string }
-    return this.workspaceService.joinByInviteCode(userId, inviteCode)
+    return this.workspaceService.joinByInviteCode(userId, inviteCode, timeZone)
   }
 }

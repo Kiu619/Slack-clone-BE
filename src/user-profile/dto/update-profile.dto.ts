@@ -2,6 +2,8 @@ import { z } from 'zod'
 
 const optionalString = z.union([z.string(), z.undefined(), z.null()])
 const optionalUrl = z.union([z.string().url(), z.undefined(), z.null()])
+const localeEnum = z.enum(['en', 'vi'])
+const timeFormatEnum = z.enum(['12h', '24h'])
 
 export const UpdateProfileSchema = z
   .object({
@@ -27,6 +29,8 @@ export const UpdateProfileSchema = z
     isAway: z.boolean().optional(),
     status: optionalString,
     theme: optionalString,
+    locale: localeEnum.optional(),
+    timeFormat: timeFormatEnum.optional(),
   })
   .partial()
 

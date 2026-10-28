@@ -123,7 +123,12 @@ export class NotificationProcessor extends WorkerHost {
             await this.db
               .select({ userId: schema.threadSubscriptions.userId })
               .from(schema.threadSubscriptions)
-              .where(eq(schema.threadSubscriptions.parentMessageId, parentId))
+              .where(
+                and(
+                  eq(schema.threadSubscriptions.parentMessageId, parentId),
+                  eq(schema.threadSubscriptions.isMuted, false),
+                ),
+              )
           )
             .map((row) => row.userId)
             .filter((userId) => userId !== senderId),

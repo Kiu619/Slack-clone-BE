@@ -8,11 +8,14 @@ import {
     Req,
     Res,
     UseGuards,
+    Inject,
+    forwardRef,
 } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import type { Request, Response } from 'express'
 import { ZodValidationPipe } from '../common/pipes/zod-validation.pipe';
 import { AuthService } from './auth.service';
+import { EmailInviteService } from '../email-invite/email-invite.service';
 import { Public } from './decorators/public.decorator';
 import { SkipWorkspaceMemberCheck } from './decorators/skip-workspace-member-check.decorator';
 import {
@@ -30,6 +33,8 @@ export class AuthController {
   constructor(
     private authService: AuthService,
     private config: ConfigService,
+    @Inject(forwardRef(() => EmailInviteService))
+    private emailInviteService: EmailInviteService,
   ) {}
 
   @Post('google/init')
@@ -37,11 +42,16 @@ export class AuthController {
   @SkipWorkspaceMemberCheck()
   @HttpCode(HttpStatus.OK)
   initGoogle(
-    @Body() body: { redirect?: string },
+    @Body() body: { redirect?: string; inviteToken?: string },
     @Res({ passthrough: true }) res: Response,
   ) {
     const redirect = this.authService.sanitizeRedirectPath(body?.redirect)
     this.authService.setOAuthRedirectCookie(res, redirect)
+    if (typeof body?.inviteToken === 'string' && body.inviteToken.length > 0) {
+      this.emailInviteService.setPendingInviteCookie(res, body.inviteToken)
+    } else {
+      this.emailInviteService.clearPendingInviteCookie(res)
+    }
     return { ok: true }
   }
 
@@ -50,11 +60,16 @@ export class AuthController {
   @SkipWorkspaceMemberCheck()
   @HttpCode(HttpStatus.OK)
   initGithub(
-    @Body() body: { redirect?: string },
+    @Body() body: { redirect?: string; inviteToken?: string },
     @Res({ passthrough: true }) res: Response,
   ) {
     const redirect = this.authService.sanitizeRedirectPath(body?.redirect)
     this.authService.setOAuthRedirectCookie(res, redirect)
+    if (typeof body?.inviteToken === 'string' && body.inviteToken.length > 0) {
+      this.emailInviteService.setPendingInviteCookie(res, body.inviteToken)
+    } else {
+      this.emailInviteService.clearPendingInviteCookie(res)
+    }
     return { ok: true }
   }
 
@@ -82,6 +97,16 @@ export class AuthController {
       user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
+
+    const pendingInvite = this.emailInviteService.readPendingInviteCookie(req)
+
+    if (pendingInvite) {
+      this.emailInviteService.clearPendingInviteCookie(res)
+      const params = new URLSearchParams({ provider: 'google' })
+      return res.redirect(
+        `${this.config.get('FRONTEND_URL')}/join/email-invite/${pendingInvite}/oauth-callback?${params}`,
+      )
+    }
 
     const redirect = this.authService.readOAuthRedirectCookie(req)
     this.authService.clearOAuthRedirectCookie(res)
@@ -115,6 +140,16 @@ export class AuthController {
       user.avatar,
     )
     this.authService.setTokenCookies(res, accessToken, refreshToken)
+
+    const pendingInvite = this.emailInviteService.readPendingInviteCookie(req)
+
+    if (pendingInvite) {
+      this.emailInviteService.clearPendingInviteCookie(res)
+      const params = new URLSearchParams({ provider: 'github' })
+      return res.redirect(
+        `${this.config.get('FRONTEND_URL')}/join/email-invite/${pendingInvite}/oauth-callback?${params}`,
+      )
+    }
 
     const redirect = this.authService.readOAuthRedirectCookie(req)
     this.authService.clearOAuthRedirectCookie(res)
@@ -174,6 +209,8 @@ export class AuthController {
   }
 
   @Post('sign-out')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @HttpCode(HttpStatus.OK)
   async signOut(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const accessToken = req.cookies?.['access_token'] as string | undefined

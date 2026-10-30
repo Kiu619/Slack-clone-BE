@@ -10,6 +10,7 @@ import { WorkspacePresenceService } from './workspace-presence.service'
 import { RedisPresenceService } from './redis-presence.service'
 import { HuddleModule } from '../huddle/huddle.module'
 import { RedisModule } from '../redis/redis.module'
+import { AuthModule } from '../auth/auth.module'
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { RedisModule } from '../redis/redis.module'
     forwardRef(() => ChannelModule),
     forwardRef(() => HuddleModule),
     RedisModule, // For RedisService in MainGateway (Redis adapter)
+    forwardRef(() => AuthModule),
   ],
   providers: [
     MainGateway,

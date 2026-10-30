@@ -74,13 +74,14 @@ export class EmailInviteService {
    * biết cần redirect về `/join/email-invite/{token}/oauth-callback`.
    */
   setPendingInviteCookie(res: Response, token: string): void {
-    const isProd = this.config.get<string>('NODE_ENV') === 'production'
     res.cookie(PENDING_INVITE_COOKIE, token, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? 'none' : 'lax',
+      secure: this.config.get<string>('NODE_ENV') === 'production',
+      sameSite:
+        this.config.get<string>('NODE_ENV') === 'production' ? 'none' : 'lax',
       maxAge: PENDING_INVITE_COOKIE_TTL_MS,
       path: '/',
+      domain: this.config.get<string>('AUTH_COOKIE_DOMAIN') || undefined,
     })
   }
 
@@ -90,7 +91,14 @@ export class EmailInviteService {
   }
 
   clearPendingInviteCookie(res: Response): void {
-    res.clearCookie(PENDING_INVITE_COOKIE, { path: '/' })
+    res.clearCookie(PENDING_INVITE_COOKIE, {
+      httpOnly: true,
+      secure: this.config.get<string>('NODE_ENV') === 'production',
+      sameSite:
+        this.config.get<string>('NODE_ENV') === 'production' ? 'none' : 'lax',
+      path: '/',
+      domain: this.config.get<string>('AUTH_COOKIE_DOMAIN') || undefined,
+    })
   }
 
   // ─── Lookup public ────────────────────────────────────────────────────────
@@ -404,7 +412,7 @@ export class EmailInviteService {
 
     // Nếu OTP nhánh mà user vừa được tạo → cần set JWT cookies
     if (body.method === 'otp' && (!currentUser || currentUser.id !== user.id) && res) {
-      const { accessToken, refreshToken } = this.auth.generateTokens(
+      const { accessToken, refreshToken } = await this.auth.createLoginTokens(
         user.id,
         user.email,
         user.name ?? null,

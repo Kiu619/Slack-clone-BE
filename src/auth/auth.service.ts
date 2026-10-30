@@ -8,11 +8,9 @@ import { DRIZZLE, type DrizzleDB } from '../database/database.module'
 import { users, accounts } from '../database/schema'
 import { RedisService } from '../redis/redis.service'
 import { MailService } from '../mail/mail.service'
+import { AuthSessionService } from './auth-session.service'
 
 const MAGIC_TOKEN_TTL = 60 * 15
-
-const ACCESS_TOKEN_COOKIE_TTL = 31 * 24 * 60 * 60 * 1000
-const REFRESH_TOKEN_COOKIE_TTL = 100 * 24 * 60 * 60 * 1000
 
 const OAUTH_REDIRECT_COOKIE_TTL_MS = 10 * 60 * 1000
 
@@ -30,16 +28,19 @@ export interface OAuthUserData {
 
 export interface AccessTokenPayload {
   sub: string
+  sid: string
   email: string
   name?: string | null
   avatar?: string | null
-  jti?: string
+  jti: string
   iat?: number
   exp?: number
 }
 
 export interface RefreshTokenPayload {
   sub: string
+  sid: string
+  jti: string
   email: string
   iat?: number
   exp?: number
@@ -53,6 +54,7 @@ export class AuthService {
     private readonly mail: MailService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly sessions: AuthSessionService,
   ) {}
 
   async findOrCreateOAuthUser(data: OAuthUserData) {
@@ -155,16 +157,13 @@ export class AuthService {
    * Cookie is NOT set if redirect is null.
    */
   setOAuthRedirectCookie(res: Response, redirect: string | null): void {
-    const isProd = this.config.get<string>('NODE_ENV') === 'production'
     if (redirect) {
       res.cookie('oauth_redirect', redirect, {
-        httpOnly: true,
-        secure: isProd,
-        sameSite: isProd ? 'none' : 'lax',
+        ...this.cookieOptions(),
         maxAge: OAUTH_REDIRECT_COOKIE_TTL_MS,
       })
     } else {
-      res.clearCookie('oauth_redirect')
+      res.clearCookie('oauth_redirect', this.cookieOptions())
     }
   }
 
@@ -180,7 +179,7 @@ export class AuthService {
 
   /** Remove the OAuth redirect cookie. */
   clearOAuthRedirectCookie(res: Response): void {
-    res.clearCookie('oauth_redirect')
+    res.clearCookie('oauth_redirect', this.cookieOptions())
   }
 
   /**
@@ -211,13 +210,15 @@ export class AuthService {
    *
    * Access token mang `jti` (random UUID) để hỗ trợ blacklist khi logout.
    */
-  generateTokens(
+  private generateTokens(
     id: string,
     email: string,
     name?: string | null,
     avatar?: string | null,
+    sid?: string,
   ) {
     const accessJti = randomUUID()
+    const sessionId = sid ?? this.sessions.newId()
 
     const accessToken = this.jwt.sign(
       {
@@ -226,22 +227,65 @@ export class AuthService {
         name: name ?? null,
         avatar: avatar ?? null,
         jti: accessJti,
+        sid: sessionId,
       },
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
-        expiresIn: this.config.get('JWT_ACCESS_EXPIRATION') ?? '30d',
+        expiresIn: this.sessions.accessSeconds,
       },
     )
 
     const refreshToken = this.jwt.sign(
-      { sub: id, email },
+      { sub: id, email, sid: sessionId, jti: randomUUID() },
       {
         secret: this.config.getOrThrow<string>('JWT_REFRESH_SECRET'),
-        expiresIn: this.config.get('JWT_REFRESH_EXPIRATION') ?? '90d',
+        expiresIn: this.sessions.refreshSeconds,
       },
     )
 
-    return { accessToken, refreshToken }
+    return { accessToken, refreshToken, sid: sessionId }
+  }
+
+  async createLoginTokens(id: string, email: string, name?: string | null, avatar?: string | null) {
+    const tokens = this.generateTokens(id, email, name, avatar)
+    await this.sessions.create(id, tokens.refreshToken, tokens.sid)
+    return tokens
+  }
+
+  async refreshTokens(rawToken: string, user: { id: string; email: string; name?: string | null; avatar?: string | null }) {
+    const payload = this.decodeRefreshToken(rawToken)
+    if (!payload?.sid || !payload.jti) {
+      throw new UnauthorizedException({ code: 'SESSION_EXPIRED', message: 'Session expired' })
+    }
+    const session = await this.sessions.assertActive(payload.sid, user.id)
+    const tokenHash = this.sessions.hash(rawToken)
+    if (session.tokenHash !== tokenHash) {
+      const grace = await this.sessions.getGrace(payload.sid, tokenHash)
+      if (grace) return grace
+      await this.sessions.revoke(payload.sid)
+      throw new UnauthorizedException({ code: 'SESSION_EXPIRED', message: 'Session expired' })
+    }
+    if (payload.exp && payload.exp - Math.floor(Date.now() / 1000) > this.sessions.rotateWindowSeconds) {
+      return { accessToken: this.generateAccessToken(user, payload.sid), refreshToken: rawToken }
+    }
+    const tokens = this.generateTokens(user.id, user.email, user.name, user.avatar, payload.sid)
+    const result = await this.sessions.rotate(payload.sid, user.id, rawToken, tokens.accessToken, tokens.refreshToken)
+    if (result === 'rotated') return tokens
+    if (result === 'stale') {
+      const grace = await this.sessions.getGrace(payload.sid, tokenHash)
+      if (grace) return grace
+      // Token cũ đã bị thay thế nhưng grace window không còn: đây là reuse,
+      // không phải concurrent refresh hợp lệ nữa.
+      await this.sessions.revoke(payload.sid)
+    }
+    throw new UnauthorizedException({ code: 'SESSION_EXPIRED', message: 'Session expired' })
+  }
+
+  private generateAccessToken(user: { id: string; email: string; name?: string | null; avatar?: string | null }, sid: string): string {
+    return this.jwt.sign({ sub: user.id, email: user.email, name: user.name ?? null, avatar: user.avatar ?? null, sid, jti: randomUUID() }, {
+      secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
+      expiresIn: this.sessions.accessSeconds,
+    })
   }
 
   /**
@@ -278,9 +322,11 @@ export class AuthService {
     refreshToken: string | undefined,
   ): Promise<void> {
     const tasks: Promise<void>[] = []
+    const sessionIds = new Set<string>()
 
     if (accessToken) {
       const payload = this.decodeAccessToken(accessToken)
+      if (payload?.sid) sessionIds.add(payload.sid)
       if (payload?.jti && payload.exp) {
         const ttlSec = this.remainingTtlSeconds(payload.exp)
         tasks.push(
@@ -291,6 +337,7 @@ export class AuthService {
 
     if (refreshToken) {
       const payload = this.decodeRefreshToken(refreshToken)
+      if (payload?.sid) sessionIds.add(payload.sid)
       if (payload?.exp) {
         const ttlSec = this.remainingTtlSeconds(payload.exp)
         tasks.push(
@@ -298,6 +345,8 @@ export class AuthService {
         )
       }
     }
+
+    for (const sid of sessionIds) tasks.push(this.sessions.revoke(sid))
 
     await Promise.all(tasks)
   }
@@ -312,28 +361,43 @@ export class AuthService {
     accessToken: string,
     refreshToken: string,
   ): void {
-    const isProd = this.config.get<string>('NODE_ENV') === 'production'
+    const options = this.cookieOptions()
+    const accessPayload = this.decodeAccessToken(accessToken)
+    const refreshPayload = this.decodeRefreshToken(refreshToken)
 
     res.cookie('access_token', accessToken, {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? 'none' : 'lax',
-      path: '/',
-      maxAge: ACCESS_TOKEN_COOKIE_TTL,
+      ...options,
+      maxAge: this.cookieMaxAge(accessPayload?.exp, this.sessions.accessSeconds),
     })
 
     res.cookie('refresh_token', refreshToken, {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? 'none' : 'lax',
-      path: '/',
-      maxAge: REFRESH_TOKEN_COOKIE_TTL,
+      ...options,
+      // Khi refresh không rotate, giữ lifetime còn lại của JWT hiện tại;
+      // không được vô tình biến một token sắp hết hạn thành cookie 30 ngày.
+      maxAge: this.cookieMaxAge(refreshPayload?.exp, this.sessions.refreshSeconds),
     })
   }
 
+  private cookieMaxAge(exp: number | undefined, fallbackSeconds: number): number {
+    if (!exp) return fallbackSeconds * 1000
+    return this.remainingTtlSeconds(exp) * 1000
+  }
+
   clearTokenCookies(res: Response): void {
-    res.clearCookie('access_token', { path: '/' })
-    res.clearCookie('refresh_token', { path: '/' })
+    const options = this.cookieOptions()
+    res.clearCookie('access_token', options)
+    res.clearCookie('refresh_token', options)
+  }
+
+  private cookieOptions() {
+    const isProd = this.config.get<string>('NODE_ENV') === 'production'
+    return {
+      httpOnly: true,
+      secure: isProd,
+      sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+      path: '/',
+      domain: this.config.get<string>('AUTH_COOKIE_DOMAIN') || undefined,
+    }
   }
 
   /** Hồ sơ tài khoản (không gồm profile theo workspace) */

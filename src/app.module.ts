@@ -32,10 +32,11 @@ import { JwtAuthGuard } from './auth/guards/jwt-auth.guard'
 import { WorkspaceMemberGuard } from './auth/guards/workspace-member.guard'
 import { CommonModule } from './common/common.module'
 import { HttpLoggerMiddleware } from './common/middleware/http-logger.middleware'
+import { validateAuthConfig } from './auth/auth-config.validation'
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({ isGlobal: true, validate: validateAuthConfig }),
     BullModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

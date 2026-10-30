@@ -35,7 +35,9 @@ async function bootstrap() {
     }
 
     const origin = req.headers.origin
-    if (typeof origin === 'string' && origin !== allowedOrigin) {
+    const fetchSite = req.headers['sec-fetch-site']
+    if ((typeof origin === 'string' && origin !== allowedOrigin) ||
+        (origin == null && typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'same-site')) {
       res.status(403).json({ message: 'Invalid origin' })
       return
     }

@@ -83,14 +83,14 @@ export class AuthController {
   @Public()
   @SkipWorkspaceMemberCheck()
   @UseGuards(GoogleOAuthGuard)
-  googleCallback(@Req() req: Request, @Res() res: Response) {
+  async googleCallback(@Req() req: Request, @Res() res: Response) {
     const user = req.user as {
       id: string
       email: string
       name?: string
       avatar?: string
     }
-    const { accessToken, refreshToken } = this.authService.generateTokens(
+    const { accessToken, refreshToken } = await this.authService.createLoginTokens(
       user.id,
       user.email,
       user.name,
@@ -126,14 +126,14 @@ export class AuthController {
   @Public()
   @SkipWorkspaceMemberCheck()
   @UseGuards(GithubOAuthGuard)
-  githubCallback(@Req() req: Request, @Res() res: Response) {
+  async githubCallback(@Req() req: Request, @Res() res: Response) {
     const user = req.user as {
       id: string
       email: string
       name?: string
       avatar?: string
     }
-    const { accessToken, refreshToken } = this.authService.generateTokens(
+    const { accessToken, refreshToken } = await this.authService.createLoginTokens(
       user.id,
       user.email,
       user.name,
@@ -177,7 +177,7 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const { user, redirect } = await this.authService.verifyMagicLink(dto.token)
-    const { accessToken, refreshToken } = this.authService.generateTokens(
+    const { accessToken, refreshToken } = await this.authService.createLoginTokens(
       user.id,
       user.email,
       user.name,
@@ -189,21 +189,19 @@ export class AuthController {
   }
 
   @Post('refresh')
+  @Public()
+  @SkipWorkspaceMemberCheck()
   @UseGuards(JwtRefreshGuard)
   @HttpCode(HttpStatus.OK)
-  refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const { id, email, name, avatar } = req.user as {
       id: string
       email: string
       name?: string | null
       avatar?: string | null
     }
-    const { accessToken, refreshToken } = this.authService.generateTokens(
-      id,
-      email,
-      name,
-      avatar,
-    )
+    const rawToken = req.cookies?.['refresh_token'] as string | undefined
+    const { accessToken, refreshToken } = await this.authService.refreshTokens(rawToken ?? '', { id, email, name, avatar })
     this.authService.setTokenCookies(res, accessToken, refreshToken)
     return { message: 'Tokens refreshed' }
   }
@@ -215,9 +213,22 @@ export class AuthController {
   async signOut(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const accessToken = req.cookies?.['access_token'] as string | undefined
     const refreshToken = req.cookies?.['refresh_token'] as string | undefined
-    await this.authService.logoutUser(accessToken, refreshToken)
-    this.authService.clearTokenCookies(res)
+    try {
+      await this.authService.logoutUser(accessToken, refreshToken)
+    } finally {
+      // Xoá cookie ngay cả khi Redis đang lỗi. Client không được giữ token
+      // đã logout; lỗi 503 vẫn được trả về để caller biết revoke chưa xác nhận.
+      this.authService.clearTokenCookies(res)
+    }
     return { message: 'Signed out successfully' }
+  }
+
+  @Post('logout')
+  @Public()
+  @SkipWorkspaceMemberCheck()
+  @HttpCode(HttpStatus.OK)
+  async logoutAlias(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    return this.signOut(req, res)
   }
 
   /** Chỉ thông tin tài khoản (email, default name/avatar). Profile workspace: `GET user-profile/me?workspaceId=` */

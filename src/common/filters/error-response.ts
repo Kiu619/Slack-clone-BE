@@ -21,6 +21,9 @@ export type ErrorCode =
   | 'THIRD_PARTY_ERROR'  // External service (Redis, S3, Cloudinary, etc.) failed
   | 'CONFLICT'           // Resource conflict (409)
   | 'TOO_MANY_REQUESTS'  // Rate limited (429)
+  | 'SESSION_EXPIRED'
+  | 'TOKEN_REVOKED'
+  | 'AUTH_STORE_UNAVAILABLE'
 
 /**
  * Maps HTTP status codes to error codes
@@ -52,4 +55,7 @@ export const ERROR_CODE_MESSAGES: Record<ErrorCode, string> = {
   THIRD_PARTY_ERROR: 'External service temporarily unavailable',
   CONFLICT: 'Resource conflict detected',
   TOO_MANY_REQUESTS: 'Too many requests. Please try again later',
+  SESSION_EXPIRED: 'Your session has expired',
+  TOKEN_REVOKED: 'Your session has been revoked',
+  AUTH_STORE_UNAVAILABLE: 'Authentication service temporarily unavailable',
 }

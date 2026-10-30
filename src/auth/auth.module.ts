@@ -10,6 +10,7 @@ import { JwtRefreshStrategy } from './strategies/jwt-refresh.strategy'
 import { WorkspaceMemberGuard } from './guards/workspace-member.guard'
 import { WorkspacePermissionsModule } from '../workspace/workspace-permissions.module'
 import { EmailInviteModule } from '../email-invite/email-invite.module'
+import { AuthSessionService } from './auth-session.service'
 
 @Module({
   imports: [
@@ -26,12 +27,13 @@ import { EmailInviteModule } from '../email-invite/email-invite.module'
   controllers: [AuthController],
   providers: [
     AuthService,
+    AuthSessionService,
     GoogleStrategy,
     GithubStrategy,
     JwtStrategy,
     JwtRefreshStrategy,
     WorkspaceMemberGuard,
   ],
-  exports: [WorkspaceMemberGuard, AuthService],
+  exports: [WorkspaceMemberGuard, AuthService, AuthSessionService],
 })
 export class AuthModule {}

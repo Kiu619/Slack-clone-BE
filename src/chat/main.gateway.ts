@@ -23,9 +23,13 @@ import { WorkspacePresenceService } from './workspace-presence.service'
 import { HuddleBroadcastService } from '../huddle/huddle-broadcast.service'
 import { HuddleService } from '../huddle/huddle.service'
 import { RedisService } from '../redis/redis.service'
+import { AuthSessionService } from '../auth/auth-session.service'
 
 interface JwtPayload {
   sub: string
+  sid: string
+  jti: string
+  exp: number
   email: string
   name?: string
   avatar?: string
@@ -66,6 +70,8 @@ export class MainGateway
   /** Redis adapter clients - cleaned up on destroy */
   private redisPubClient: Redis | null = null
   private redisSubClient: Redis | null = null
+  private authSubscriber: Redis | null = null
+  private readonly sessionRevalidationTimers = new Map<string, NodeJS.Timeout>()
 
   constructor(
     private readonly messageService: MessageService,
@@ -78,11 +84,30 @@ export class MainGateway
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly redisService: RedisService,
+    private readonly authSessions: AuthSessionService,
   ) {}
 
   async afterInit(server: Server) {
     const nsName = (server as any).name
     console.log(`[MainGateway] afterInit - server.name: '${nsName}'`)
+
+    // Subscribe revoke events independently from the Socket.IO adapter. An
+    // adapter outage must not disable session-wide socket revocation.
+    try {
+      const redis = this.redisService.getRedisInstance()
+      if (redis) {
+        this.authSubscriber = redis.duplicate()
+        await this.authSubscriber.subscribe('auth:session-revoked')
+        this.authSubscriber.on('message', (channel, sid) => {
+          if (channel !== 'auth:session-revoked') return
+          for (const socket of server.sockets.sockets.values()) {
+            if (socket.data.sid === sid) socket.disconnect(true)
+          }
+        })
+      }
+    } catch (error) {
+      this.logger.error('Failed to initialize auth revocation subscriber', error)
+    }
 
     // Setup Redis adapter for multi-worker support
     try {
@@ -115,6 +140,11 @@ export class MainGateway
   }
 
   async onModuleDestroy() {
+    if (this.authSubscriber) await this.authSubscriber.quit()
+    for (const timer of this.sessionRevalidationTimers.values()) {
+      clearInterval(timer)
+    }
+    this.sessionRevalidationTimers.clear()
     // Cleanup Redis adapter connections
     if (this.redisPubClient) {
       await this.redisPubClient.quit()
@@ -142,10 +172,18 @@ export class MainGateway
       const secret = this.configService.get<string>('JWT_ACCESS_SECRET')
       const payload = this.jwtService.verify<JwtPayload>(token, { secret })
 
-      if (!payload.sub) {
+      if (!payload.sub || !payload.sid || !payload.jti || !payload.exp) {
         client.disconnect()
         return
       }
+
+      await this.authSessions.assertActive(payload.sid, payload.sub)
+      if (await this.redisService.isAccessTokenBlacklisted(payload.jti)) {
+        client.disconnect()
+        return
+      }
+      client.data.sid = payload.sid
+      this.startSessionRevalidation(client, payload)
 
       const socketData = client.data as SocketData
       socketData.userId = payload.sub
@@ -170,6 +208,7 @@ export class MainGateway
   }
 
   handleDisconnect(client: Socket) {
+    this.stopSessionRevalidation(client.id)
     const userInfo = this.socketUserMap.get(client.id)
     if (userInfo) {
       const affectedWorkspaceIds =
@@ -194,6 +233,40 @@ export class MainGateway
         `Socket ${client.id} disconnected from MainGateway: user ${userInfo.userId}`,
       )
     }
+  }
+
+  private startSessionRevalidation(client: Socket, payload: JwtPayload) {
+    const expiryTimer = setTimeout(
+      () => client.disconnect(true),
+      Math.max(0, payload.exp * 1000 - Date.now()),
+    )
+    const revalidationTimer = setInterval(() => {
+      void this.revalidateSocketSession(client, payload)
+    }, this.authSessions.socketRevalidationSeconds * 1000)
+    this.sessionRevalidationTimers.set(client.id, revalidationTimer)
+    client.once('disconnect', () => clearTimeout(expiryTimer))
+  }
+
+  private async revalidateSocketSession(client: Socket, payload: JwtPayload) {
+    if (!client.connected) return
+    try {
+      await this.authSessions.assertActive(payload.sid, payload.sub)
+      if (await this.redisService.isAccessTokenBlacklisted(payload.jti)) {
+        client.disconnect(true)
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Socket ${client.id}: Session revalidation failed; disconnecting`,
+        error,
+      )
+      client.disconnect(true)
+    }
+  }
+
+  private stopSessionRevalidation(socketId: string) {
+    const timer = this.sessionRevalidationTimers.get(socketId)
+    if (timer) clearInterval(timer)
+    this.sessionRevalidationTimers.delete(socketId)
   }
 
   // --- Room Management ---

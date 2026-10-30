@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
+import { Injectable, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import Redis from 'ioredis'
 
@@ -322,6 +322,10 @@ export class RedisService implements OnModuleInit {
       this.logger.warn(
         `Failed to blacklist access token (jti=${jti}): ${error}`,
       )
+      throw new ServiceUnavailableException({
+        code: 'AUTH_STORE_UNAVAILABLE',
+        message: 'Authentication store unavailable',
+      })
     }
   }
 
@@ -333,8 +337,10 @@ export class RedisService implements OnModuleInit {
       this.logger.warn(
         `Failed to check access token blacklist (jti=${jti}): ${error}`,
       )
-      // Fail-open: nếu Redis lỗi, cho qua để không block user.
-      return false
+      throw new ServiceUnavailableException({
+        code: 'AUTH_STORE_UNAVAILABLE',
+        message: 'Authentication store unavailable',
+      })
     }
   }
 
@@ -350,6 +356,10 @@ export class RedisService implements OnModuleInit {
       this.logger.warn(
         `Failed to blacklist refresh token: ${error}`,
       )
+      throw new ServiceUnavailableException({
+        code: 'AUTH_STORE_UNAVAILABLE',
+        message: 'Authentication store unavailable',
+      })
     }
   }
 
@@ -362,7 +372,10 @@ export class RedisService implements OnModuleInit {
       this.logger.warn(
         `Failed to check refresh token blacklist: ${error}`,
       )
-      return false
+      throw new ServiceUnavailableException({
+        code: 'AUTH_STORE_UNAVAILABLE',
+        message: 'Authentication store unavailable',
+      })
     }
   }
 

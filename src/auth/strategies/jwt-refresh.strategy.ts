@@ -5,6 +5,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt'
 import { ConfigService } from '@nestjs/config'
 import type { Request } from 'express'
 import { AuthService } from '../auth.service'
+import { AuthSessionService } from '../auth-session.service'
 import { RedisService } from '../../redis/redis.service'
 
 @Injectable()
@@ -15,6 +16,7 @@ export class JwtRefreshStrategy extends PassportStrategy(
   constructor(
     config: ConfigService,
     private authService: AuthService,
+    private sessions: AuthSessionService,
     private redis: RedisService,
   ) {
     super({
@@ -23,26 +25,28 @@ export class JwtRefreshStrategy extends PassportStrategy(
       ]),
       secretOrKey: config.getOrThrow<string>('JWT_REFRESH_SECRET'),
       ignoreExpiration: false,
+      passReqToCallback: true,
     })
   }
 
-  authenticate(req: Request) {
-    // Store raw token so validate() can access it for blacklist check.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ;(this as any)._rawRefreshToken =
-      (req?.cookies?.refresh_token as string) ?? ''
-    return super.authenticate(req)
-  }
-
-  async validate(payload: { sub: string; email: string }) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rawToken = (this as any)._rawRefreshToken as string | undefined
-    if (rawToken) {
-      const blacklisted = await this.redis.isRefreshTokenBlacklisted(rawToken)
-      if (blacklisted) {
-        throw new UnauthorizedException('Refresh token has been revoked')
-      }
+  async validate(
+    req: Request,
+    payload: { sub: string; email: string; sid: string; jti: string },
+  ) {
+    if (!payload.sid || !payload.jti) {
+      throw new UnauthorizedException({
+        code: 'SESSION_EXPIRED',
+        message: 'Session expired',
+      })
     }
+    const rawToken = req.cookies?.['refresh_token'] as string | undefined
+    if (!rawToken || await this.redis.isRefreshTokenBlacklisted(rawToken)) {
+      throw new UnauthorizedException({
+        code: 'TOKEN_REVOKED',
+        message: 'Refresh token has been revoked',
+      })
+    }
+    await this.sessions.assertActive(payload.sid, payload.sub)
 
     const user = await this.authService.getAccountById(payload.sub)
     if (!user) throw new UnauthorizedException()
